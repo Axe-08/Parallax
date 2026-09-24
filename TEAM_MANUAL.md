@@ -36,14 +36,14 @@ Because AWS GPU is unavailable, **Kaggle is our primary GPU engine for Day 1**:
 Account #1 hosts the central single source of truth for datasets, golden splits, and model checkpoints.
 
 ### Bucket Configuration
-* **Bucket Name:** `s3://amazon-ml-2026-parallax-shared`
+* **Bucket Name:** `s3://amazon-ml-challange-2026-parallax`
 * **Region:** `us-east-1`
 * **Object Ownership:** *Bucket owner enforced*
 
 ### Team IAM Credentials
 Instead of fragile cross-account IAM role assumptions, Account #1 generates one dedicated IAM User:
 1. In AWS Console (Account #1) $\rightarrow$ **IAM** $\rightarrow$ **Users** $\rightarrow$ **Create user** named `parallax-team-storage`.
-2. Attach policy: `AmazonS3FullAccess` (or scoped policy for `amazon-ml-2026-parallax-shared`).
+2. Attach policy: `AmazonS3FullAccess` (or scoped policy for `amazon-ml-challange-2026-parallax`).
 3. Create **Access Keys (CLI)** $\rightarrow$ Securely share `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the team channel.
 
 ### Connecting Teammates (EC2, Kaggle, Local)
@@ -59,7 +59,7 @@ aws configure
 Verify connection:
 ```bash
 # Check bucket access
-aws s3 ls s3://amazon-ml-2026-parallax-shared/
+aws s3 ls s3://amazon-ml-challange-2026-parallax/
 
 # Sync helper using Parallax CLI
 uv run python -m parallax.utils.s3_sync list

@@ -46,7 +46,7 @@ class S3Config(BaseModel):
     """Central AWS S3 storage configuration."""
 
     bucket_name: str = Field(
-        default_factory=lambda: os.getenv("PARALLAX_S3_BUCKET", "amazon-ml-2026-parallax-shared")
+        default_factory=lambda: os.getenv("PARALLAX_S3_BUCKET", "amazon-ml-challange-2026-parallax")
     )
     region: str = Field(default_factory=lambda: os.getenv("PARALLAX_AWS_REGION", "us-east-1"))
     prefix: str = Field(default="challenge-data")

@@ -21,7 +21,7 @@ import pandas as pd
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "PASTE_YOUR_KEY_ID_HERE")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "PASTE_YOUR_SECRET_KEY_HERE")
 AWS_REGION = "us-east-1"
-S3_BUCKET = "amazon-ml-2026-parallax-shared"
+S3_BUCKET = "amazon-ml-challange-2026-parallax"
 
 # Configure boto3 session
 session = boto3.Session(
