@@ -74,8 +74,28 @@ class ParallaxConfig(BaseModel):
     debug: bool = Field(default=False)
 
 
+def load_dotenv(env_path: Path | None = None) -> None:
+    """Load key-value pairs from .env into os.environ if not already set."""
+    path = env_path or (_default_root() / ".env")
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            clean = line.strip()
+            if not clean or clean.startswith("#") or "=" not in clean:
+                continue
+            k, v = clean.split("=", 1)
+            k, v = k.strip(), v.strip()
+            # Strip matching quotes if present
+            if len(v) >= 2 and (
+                (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'"))
+            ):
+                v = v[1:-1]
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
 def get_config() -> ParallaxConfig:
     """Retrieve default configuration with environment overrides."""
+    load_dotenv()
     cfg = ParallaxConfig()
     cfg.paths.ensure_directories()
     return cfg
