@@ -1,0 +1,62 @@
+# Virtual environments & dependencies
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Cache directories
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Local Challenge Data (Large datasets stored in S3)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/golden_split/*
+!data/golden_split/.gitkeep
+data/images/*
+!data/images/.gitkeep
+
+# Submissions & Artifacts
+submissions/*
+!submissions/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+models_weights/*
+!models_weights/.gitkeep
+
+# Large media & model formats
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.tar.gz
+*.zip
+*.parquet
+
+# Credentials & environment
+.env
+.env.*
+!.env.example
+*.pem
+credentials
+aws_credentials.json
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
