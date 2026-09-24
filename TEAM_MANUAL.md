@@ -13,12 +13,9 @@ Every team member must verify these 4 items before the challenge starts:
 * In the top-right navbar, set region to **US East (N. Virginia) `us-east-1`**.
 * *Rationale:* All centralized S3 storage and EC2 compute instances live in `us-east-1`. Same-region EC2 $\leftrightarrow$ S3 communication has **zero data-transfer egress fees** and operates at **10–25 Gbps**.
 
-### [ ] 2. Request GPU Quota Increase
-New AWS accounts have a default limit of **0 GPU vCPUs**. Request an increase immediately (approvals can take 2–12 hours):
-1. Navigate to **Service Quotas** $\rightarrow$ **AWS Services** $\rightarrow$ **Amazon Elastic Compute Cloud (EC2)**.
-2. Search: **`All G and VT Spot Instance Requests`** $\rightarrow$ Click **Request quota increase** $\rightarrow$ Request **`8`** vCPUs (sufficient for 1x `g4dn.2xlarge` or 2x `g4dn.xlarge`).
-3. Search: **`Running On-Demand G and VT instances`** $\rightarrow$ Click **Request quota increase** $\rightarrow$ Request **`4`** vCPUs.
-4. *Backup Request:* Teammate #3 should submit the same request in `ap-south-1` (Mumbai) as a regional redundancy check.
+### [✓] 2. AWS GPU Quota Status: REJECTED (Expected & Accounted For)
+* AWS automatically denies GPU instance quotas (`g4dn`/`g5`) on new promotional accounts.
+* **Impact on Strategy:** Zero impact. We do not need AWS GPUs. We keep AWS 100% focused on **CPU Spot data downloading (`c6i.xlarge` - 5 vCPU quota approved)** and **Central S3 Storage**.
 
 ### [ ] 3. Set Hard Budget Alerts ($180 USD)
 Prevent unexpected credit exhaustion across the 3 AWS accounts:
@@ -26,11 +23,11 @@ Prevent unexpected credit exhaustion across the 3 AWS accounts:
 2. Set budget amount: **`$180` USD** (preserving a $20 buffer from your $200 credit).
 3. Set alert thresholds at **25% ($45)**, **50% ($90)**, **75% ($135)**, and **90% ($162)** with notifications sent to all 3 teammates.
 
-### [ ] 4. Verify Kaggle GPU Quota (90 Hours Free Total)
-If AWS denies GPU quotas, Kaggle is our primary Day-1 GPU engine:
+### [ ] 4. Verify Kaggle GPU Quota (Our Primary Day-1 GPU Engine)
+Because AWS GPU is unavailable, **Kaggle is our primary GPU engine for Day 1**:
 * Navigate to [kaggle.com/settings](https://www.kaggle.com/settings).
 * Ensure phone verification is completed (unlocks 30 hrs/week of NVIDIA T4 / 2x T4 per person).
-* $3 \times 30 = \mathbf{90\text{ hours of free GPU compute}}$.
+* $3 \times 30 = \mathbf{90\text{ hours of free GPU compute}}$ (16GB VRAM each, exactly matching AWS `g4dn.xlarge`).
 
 ---
 
