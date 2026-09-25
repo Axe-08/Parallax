@@ -67,3 +67,8 @@ aws_credentials.json
 .vscode/
 *.swp
 *.swo
+
+# Agent skills, tooling & IDE artifacts
+.agents/
+.claude/
+skills-lock.json
