@@ -1,12 +1,5 @@
-"""Models package for Parallax."""
+"""Parallax Model Architecture Package."""
 
-from parallax.models.base import BaseModel
-from parallax.models.ensemble import PriorityFallbackEnsemble
-from parallax.models.rules import RegexRuleEngine, normalize_unit
+from parallax.models.matcher import LightGBMMatcher
 
-__all__ = [
-    "BaseModel",
-    "PriorityFallbackEnsemble",
-    "RegexRuleEngine",
-    "normalize_unit",
-]
+__all__ = ["LightGBMMatcher"]

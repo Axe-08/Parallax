@@ -7,9 +7,11 @@ requires-python = ">=3.10"
 dependencies = [
     "aiohttp>=3.14.3",
     "boto3>=1.43.101",
+    "lightgbm>=4.7.0",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
     "pydantic>=2.7.0",
+    "rapidfuzz>=3.14.5",
     "scikit-learn>=1.7.2",
     "tqdm>=4.70.1",
 ]
