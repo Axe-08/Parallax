@@ -35,15 +35,19 @@ class DualChannelTFIDFBlocker:
         self,
         name_top_k: int = 35,
         addr_top_k: int = 25,
+        translit_top_k: int = 20,
         name_min_sim: float = 0.15,
         addr_min_sim: float = 0.20,
+        translit_min_sim: float = 0.15,
         batch_size: int = 2000,
         show_progress: bool = True,
     ) -> None:
         self.name_top_k = name_top_k
         self.addr_top_k = addr_top_k
+        self.translit_top_k = translit_top_k
         self.name_min_sim = name_min_sim
         self.addr_min_sim = addr_min_sim
+        self.translit_min_sim = translit_min_sim
         self.batch_size = batch_size
         self.show_progress = show_progress
 
@@ -260,6 +264,63 @@ class DualChannelTFIDFBlocker:
                             for cand_id in cands:
                                 if tgt_prefixes.get(cand_id, "") == s1_pfx:
                                     candidate_pairs[s1_id].add(cand_id)
+
+            # --- Channel D: Transliterated Name Character 3-Gram TF-IDF ---
+            if "translit_name" in s1_c and "translit_name" in tgt_c:
+                s1_translit = s1_c["translit_name"].fillna("").astype(str).tolist()
+                tgt_translit = tgt_c["translit_name"].fillna("").astype(str).tolist()
+
+                if any(t.strip() for t in tgt_translit):
+                    vec_translit = TfidfVectorizer(
+                        analyzer="char",
+                        ngram_range=(3, 3),
+                        min_df=1,
+                        sublinear_tf=True,
+                    )
+                    tgt_translit_mat = vec_translit.fit_transform(tgt_translit).T
+                    
+                    tgt_ids_translit = tgt_c["entity_id"].tolist()
+
+                    batch_ranges_translit = list(range(0, len(s1_c), self.batch_size))
+                    pbar_translit = tqdm(
+                        batch_ranges_translit,
+                        desc=f"  ⚡ Blocking [{country}|Translit TF-IDF]",
+                        unit="batch",
+                        leave=False,
+                        disable=not self.show_progress,
+                    )
+                    for start_idx in pbar_translit:
+                        end_idx = min(start_idx + self.batch_size, len(s1_c))
+                        s1_batch_translit = s1_translit[start_idx:end_idx]
+                        s1_batch_ids = s1_c["entity_id"].iloc[start_idx:end_idx].tolist()
+
+                        batch_mat = vec_translit.transform(s1_batch_translit)
+                        batch_sims = batch_mat.dot(tgt_translit_mat)
+
+                        for i, s1_id in enumerate(s1_batch_ids):
+                            if not s1_batch_translit[i].strip():
+                                continue
+                            r_start = batch_sims.indptr[i]
+                            r_end = batch_sims.indptr[i + 1]
+                            if r_start == r_end:
+                                continue
+                            scores = batch_sims.data[r_start:r_end]
+                            col_idx = batch_sims.indices[r_start:r_end]
+
+                            valid_mask = scores >= self.translit_min_sim
+                            if not np.any(valid_mask):
+                                continue
+                            scores = scores[valid_mask]
+                            col_idx = col_idx[valid_mask]
+
+                            if len(scores) > self.translit_top_k:
+                                top_sub = np.argpartition(scores, -self.translit_top_k)[-self.translit_top_k :]
+                                top_cols = col_idx[top_sub]
+                            else:
+                                top_cols = col_idx
+
+                            for c_idx in top_cols:
+                                candidate_pairs[s1_id].add(tgt_ids_translit[c_idx])
 
             if checkpoint_mgr is not None:
                 c_rows_s1: list[str] = []
