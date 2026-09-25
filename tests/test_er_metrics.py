@@ -44,7 +44,7 @@ def test_evaluate_predictions_aggregation():
     }
     preds = {
         "S1-001": {"S2-10", "S3-20"},  # 1.0
-        "S1-002": set(),               # 1.0
+        "S1-002": set(),  # 1.0
     }
     report = evaluate_resolution_predictions(gt, preds)
     assert report.macro_f05 == 1.0

@@ -25,16 +25,23 @@ data/processed/*
 !data/processed/.gitkeep
 data/golden_split/*
 !data/golden_split/.gitkeep
+data/medium_split_200k/*
+!data/medium_split_200k/.gitkeep
 data/images/*
 !data/images/.gitkeep
 
 # Submissions & Artifacts
 submissions/*
 !submissions/.gitkeep
+output/*
+!output/.gitkeep
 checkpoints/*
 !checkpoints/.gitkeep
 models_weights/*
 !models_weights/.gitkeep
+reports/*.log
+reports/*.json
+reports/*.jsonl
 
 # Large media & model formats
 *.bin

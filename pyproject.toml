@@ -10,6 +10,7 @@ dependencies = [
     "lightgbm>=4.7.0",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
+    "pyarrow>=25.0.1",
     "pydantic>=2.7.0",
     "rapidfuzz>=3.14.5",
     "scikit-learn>=1.7.2",

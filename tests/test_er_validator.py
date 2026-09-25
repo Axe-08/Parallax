@@ -29,17 +29,13 @@ def test_validator_pass_scenario(tmp_path: Path):
 
     matching_file = tmp_path / "matching_results.tsv"
     matching_file.write_text(
-        "source1_entity_id\tmatched_entity_ids\n"
-        "S1-100\tS2-100\n"
-        "S1-200\t\n",  # singleton
+        "source1_entity_id\tmatched_entity_ids\nS1-100\tS2-100\nS1-200\t\n",  # singleton
         encoding="utf-8",
     )
 
     cand_file = tmp_path / "candidate_pairs.tsv"
     cand_file.write_text(
-        "source1_entity_id\tcandidate_entity_ids\n"
-        "S1-100\tS2-100,S3-200\n"
-        "S1-200\t\n",
+        "source1_entity_id\tcandidate_entity_ids\nS1-100\tS2-100,S3-200\nS1-200\t\n",
         encoding="utf-8",
     )
 
@@ -57,15 +53,13 @@ def test_validator_catches_self_match(tmp_path: Path):
     test_dir = tmp_path / "test"
     test_dir.mkdir(parents=True)
     (test_dir / "test_source1.tsv").write_text(
-        "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
-        "S1-100\tAcme\t500 Market\tUS\n",
+        "entity_id\tbusiness_name\tbusiness_address\tcountry\nS1-100\tAcme\t500 Market\tUS\n",
         encoding="utf-8",
     )
 
     matching_file = tmp_path / "matching_results.tsv"
     matching_file.write_text(
-        "source1_entity_id\tmatched_entity_ids\n"
-        "S1-100\tS1-100\n",  # Self-match error!
+        "source1_entity_id\tmatched_entity_ids\nS1-100\tS1-100\n",  # Self-match error!
         encoding="utf-8",
     )
 

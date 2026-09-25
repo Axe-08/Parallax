@@ -42,11 +42,12 @@ class SingletonGatedPredictor:
         # Filter by threshold
         filtered = scored_pairs_df[scored_pairs_df["prob"] >= tau]
 
-        for _, row in filtered.iterrows():
-            s1_id = str(row["s1_id"])
-            cand_id = str(row["cand_id"])
-            if s1_id in predictions:
-                predictions[s1_id].add(cand_id)
+        for s1, cand in zip(
+            filtered["s1_id"].to_numpy(), filtered["cand_id"].to_numpy(), strict=False
+        ):
+            s1_str = str(s1)
+            if s1_str in predictions:
+                predictions[s1_str].add(str(cand))
 
         return predictions
 

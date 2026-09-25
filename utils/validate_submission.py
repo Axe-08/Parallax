@@ -82,9 +82,7 @@ def validate_id_list_file(
             return None
         parts = first.rstrip("\r\n").split("\t")
         if tuple(parts) != expected_header:
-            errors.append(
-                f"{name}: header must be '\\t'.join({expected_header}), found {parts}."
-            )
+            errors.append(f"{name}: header must be '\\t'.join({expected_header}), found {parts}.")
             return None
 
         for line_no, line in enumerate(f, 2):
@@ -187,14 +185,10 @@ def validate(
             candidate_path, CANDIDATE_HEADER, "candidate_entity_ids", required, valid_ids, errors
         )
     elif candidate_path:
-        warnings.append(
-            f"{candidate_path} not found — skipping candidate_pairs.tsv checks."
-        )
+        warnings.append(f"{candidate_path} not found — skipping candidate_pairs.tsv checks.")
 
     if matched is not None and candidate is not None:
-        offenders = {
-            s1 for s1, mids in matched.items() if mids - candidate.get(s1, set())
-        }
+        offenders = {s1 for s1, mids in matched.items() if mids - candidate.get(s1, set())}
         if offenders:
             warnings.append(
                 f"{len(offenders)} S1 entity(ies) have matched IDs not present in "

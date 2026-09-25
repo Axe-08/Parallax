@@ -107,9 +107,7 @@ def run_pipeline(
     # 4. Pairwise Feature Extraction
     print("==> 4. Extracting Pairwise RapidFuzz & Structural Features...")
     extractor = PairwiseFeatureExtractor()
-    pairs_df = extractor.extract_features_df(
-        candidates, s1_wide, target_wide, ground_truth=gt_dict
-    )
+    pairs_df = extractor.extract_features_df(candidates, s1_wide, target_wide, ground_truth=gt_dict)
     print(f"   ✓ Extracted {len(pairs_df):,} candidate pairs.\n")
 
     # 5. Training / Evaluation
@@ -133,9 +131,7 @@ def run_pipeline(
 
         val_gt = {k: v for k, v in gt_dict.items() if k in val_s1}
         best_tau, best_score = matcher.optimize_threshold(val_pairs, val_gt)
-        print(
-            f"   ✓ Optimal Threshold tau = {best_tau:.2f} (Macro F0.5 = {best_score:.4f})\n"
-        )
+        print(f"   ✓ Optimal Threshold tau = {best_tau:.2f} (Macro F0.5 = {best_score:.4f})\n")
 
         # Predict on validation holdout
         val_pairs["prob"] = matcher.predict_proba(val_pairs)

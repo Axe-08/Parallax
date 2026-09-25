@@ -41,20 +41,64 @@ class FailureDiagnosticsLogger:
         Analyze predictions against ground truth and candidate sets,
         writing out failures_v1.jsonl and diagnostics_v1.md.
         """
-        s1_dict = s1_df.set_index("entity_id").to_dict("index")
-        tgt_dict = target_df.set_index("entity_id").to_dict("index")
+        s1_names = dict(
+            zip(
+                s1_df["entity_id"].astype(str),
+                s1_df["business_name"].fillna("").astype(str),
+                strict=False,
+            )
+        )
+        s1_addrs = (
+            dict(
+                zip(
+                    s1_df["entity_id"].astype(str),
+                    s1_df["business_address"].fillna("").astype(str),
+                    strict=False,
+                )
+            )
+            if "business_address" in s1_df
+            else {}
+        )
+        tgt_names = dict(
+            zip(
+                target_df["entity_id"].astype(str),
+                target_df["business_name"].fillna("").astype(str),
+                strict=False,
+            )
+        )
+        tgt_addrs = (
+            dict(
+                zip(
+                    target_df["entity_id"].astype(str),
+                    target_df["business_address"].fillna("").astype(str),
+                    strict=False,
+                )
+            )
+            if "business_address" in target_df
+            else {}
+        )
 
         prob_lookup: dict[tuple[str, str], float] = {}
-        if len(scored_pairs_df) > 0 and "s1_id" in scored_pairs_df and "cand_id" in scored_pairs_df:
-            for _, row in scored_pairs_df.iterrows():
-                prob_lookup[(str(row["s1_id"]), str(row["cand_id"]))] = float(row.get("prob", 0.0))
+        if (
+            len(scored_pairs_df) > 0
+            and "s1_id" in scored_pairs_df
+            and "cand_id" in scored_pairs_df
+            and "prob" in scored_pairs_df
+        ):
+            s1_arr = scored_pairs_df["s1_id"].astype(str).to_numpy()
+            cand_arr = scored_pairs_df["cand_id"].astype(str).to_numpy()
+            prob_arr = scored_pairs_df["prob"].to_numpy()
+            mask = prob_arr >= 0.01
+            for s1_i, cand_i, p_val in zip(
+                s1_arr[mask], cand_arr[mask], prob_arr[mask], strict=False
+            ):
+                prob_lookup[(s1_i, cand_i)] = float(p_val)
 
         failures: list[FailureRecord] = []
 
         for s1_id, true_set in ground_truth.items():
-            s1_row = s1_dict.get(s1_id, {})
-            s1_name = str(s1_row.get("business_name", s1_id))
-            s1_addr = s1_row.get("business_address")
+            s1_name = s1_names.get(s1_id, s1_id)
+            s1_addr = s1_addrs.get(s1_id)
 
             cand_set = candidates.get(s1_id, set())
             pred_set = predictions.get(s1_id, set())
@@ -62,9 +106,8 @@ class FailureDiagnosticsLogger:
             # 1. Singleton Violations
             if len(true_set) == 0 and len(pred_set) > 0:
                 for false_cand in pred_set:
-                    c_row = tgt_dict.get(false_cand, {})
-                    c_name = str(c_row.get("business_name", false_cand))
-                    c_addr = c_row.get("business_address")
+                    c_name = tgt_names.get(false_cand, false_cand)
+                    c_addr = tgt_addrs.get(false_cand)
                     score = prob_lookup.get((s1_id, false_cand))
 
                     failures.append(
@@ -87,9 +130,8 @@ class FailureDiagnosticsLogger:
             if len(true_set) > 0:
                 false_positives = pred_set - true_set
                 for fp in false_positives:
-                    c_row = tgt_dict.get(fp, {})
-                    c_name = str(c_row.get("business_name", fp))
-                    c_addr = c_row.get("business_address")
+                    c_name = tgt_names.get(fp, fp)
+                    c_addr = tgt_addrs.get(fp)
                     score = prob_lookup.get((s1_id, fp))
 
                     failures.append(
@@ -113,9 +155,8 @@ class FailureDiagnosticsLogger:
             if len(true_set) > 0:
                 missed = true_set - pred_set
                 for fn in missed:
-                    c_row = tgt_dict.get(fn, {})
-                    c_name = str(c_row.get("business_name", fn))
-                    c_addr = c_row.get("business_address")
+                    c_name = tgt_names.get(fn, fn)
+                    c_addr = tgt_addrs.get(fn)
                     score = prob_lookup.get((s1_id, fn))
 
                     if fn not in cand_set:
@@ -162,9 +203,7 @@ class FailureDiagnosticsLogger:
 
         by_type: dict[str, int] = {}
         for fail_item in failures:
-            by_type[fail_item.failure_type.value] = (
-                by_type.get(fail_item.failure_type.value, 0) + 1
-            )
+            by_type[fail_item.failure_type.value] = by_type.get(fail_item.failure_type.value, 0) + 1
 
         with open(md_path, "w", encoding="utf-8") as f:
             f.write("# Parallax V1 Performance & Failure Diagnostics Report\n\n")
@@ -230,9 +269,7 @@ class FailureDiagnosticsLogger:
                 if subset:
                     f.write(f"### {ftype.value} Examples\n\n")
                     for i, fail in enumerate(subset, 1):
-                        f.write(
-                            f"**Case #{i} [S1: `{fail.s1_id}` ↔ Cand: `{fail.cand_id}`]**\n"
-                        )
+                        f.write(f"**Case #{i} [S1: `{fail.s1_id}` ↔ Cand: `{fail.cand_id}`]**\n")
                         f.write(
                             f"- **S1 Name / Address:** `{fail.s1_name}` | `{fail.s1_address}`\n"
                         )

@@ -8,10 +8,10 @@ from parallax.preprocessing.transliteration import (
 
 
 def test_is_brahmic_char():
-    assert is_brahmic_char("क") is True   # Devanagari
-    assert is_brahmic_char("ক") is True   # Bengali
-    assert is_brahmic_char("ક") is True   # Gujarati
-    assert is_brahmic_char("ಕ") is True   # Kannada
+    assert is_brahmic_char("क") is True  # Devanagari
+    assert is_brahmic_char("ক") is True  # Bengali
+    assert is_brahmic_char("ક") is True  # Gujarati
+    assert is_brahmic_char("ಕ") is True  # Kannada
     assert is_brahmic_char("A") is False  # Latin
     assert is_brahmic_char("é") is False  # Latin-1
 

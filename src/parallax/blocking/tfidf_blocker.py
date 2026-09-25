@@ -12,12 +12,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
+from tqdm import tqdm
 
 from parallax.data.contracts import write_candidate_pairs_tsv
+
+if TYPE_CHECKING:
+    from parallax.utils.checkpoint_manager import CheckpointManager
 
 
 class DualChannelTFIDFBlocker:
@@ -32,18 +37,21 @@ class DualChannelTFIDFBlocker:
         addr_top_k: int = 25,
         name_min_sim: float = 0.15,
         addr_min_sim: float = 0.20,
-        batch_size: int = 500,
+        batch_size: int = 2000,
+        show_progress: bool = True,
     ) -> None:
         self.name_top_k = name_top_k
         self.addr_top_k = addr_top_k
         self.name_min_sim = name_min_sim
         self.addr_min_sim = addr_min_sim
         self.batch_size = batch_size
+        self.show_progress = show_progress
 
     def generate_candidates(
         self,
         s1_df: pd.DataFrame,
         target_df: pd.DataFrame,
+        checkpoint_mgr: CheckpointManager | None = None,
     ) -> dict[str, set[str]]:
         """
         Generate candidate pairs partitioned by country.
@@ -54,7 +62,43 @@ class DualChannelTFIDFBlocker:
         # Process each country partition independently
         countries = s1_df["country"].unique()
 
+        def _build_texts(
+            df: pd.DataFrame, primary_col: str, fallback_col: str, translit_col: str
+        ) -> list[str]:
+            if primary_col in df:
+                p_s = df[primary_col].fillna("").astype(str).str.strip()
+                if fallback_col in df:
+                    empty = p_s == ""
+                    if empty.any():
+                        p_s[empty] = df.loc[empty, fallback_col].fillna("").astype(str).str.strip()
+            elif fallback_col in df:
+                p_s = df[fallback_col].fillna("").astype(str).str.strip()
+            else:
+                p_s = pd.Series([""] * len(df), index=df.index)
+
+            if translit_col in df:
+                t_s = df[translit_col].fillna("").astype(str).str.strip()
+                diff_mask = (t_s != "") & (t_s != p_s)
+                res = p_s.copy()
+                if diff_mask.any():
+                    res[diff_mask] = p_s[diff_mask] + " " + t_s[diff_mask]
+                return [str(x) for x in res.tolist()]
+            return [str(x) for x in p_s.tolist()]
+
         for country in countries:
+            cp_key = f"candidates_{country}"
+            if checkpoint_mgr is not None and checkpoint_mgr.has_checkpoint(cp_key):
+                loaded_df = checkpoint_mgr.load_dataframe(cp_key)
+                if loaded_df is not None:
+                    s1_arr = loaded_df["s1_id"].to_numpy()
+                    cand_arr = loaded_df["cand_id"].to_numpy()
+                    for s1, cand in zip(s1_arr, cand_arr, strict=False):
+                        if s1 in candidate_pairs:
+                            candidate_pairs[s1].add(cand)
+                    msg = f"  ⚡ [Checkpoint] Loaded {len(loaded_df):,} candidates for [{country}]."
+                    print(msg)
+                    continue
+
             s1_c = s1_df[s1_df["country"] == country].reset_index(drop=True)
             tgt_c = target_df[target_df["country"] == country].reset_index(drop=True)
 
@@ -62,100 +106,175 @@ class DualChannelTFIDFBlocker:
                 continue
 
             # Build dual-representation blocking texts (native + transliterated Latin)
-            s1_names: list[str] = []
-            for _, r in s1_c.iterrows():
-                p = str(r.get("soft_name", r.get("business_name", ""))).strip()
-                t = str(r.get("translit_name", "")).strip()
-                s1_names.append(f"{p} {t}" if (t and t != p) else p)
-
-            tgt_names: list[str] = []
-            for _, r in tgt_c.iterrows():
-                p = str(r.get("soft_name", r.get("business_name", ""))).strip()
-                t = str(r.get("translit_name", "")).strip()
-                tgt_names.append(f"{p} {t}" if (t and t != p) else p)
-
-            s1_addrs: list[str] = []
-            for _, r in s1_c.iterrows():
-                p = str(r.get("clean_address", r.get("business_address", ""))).strip()
-                t = str(r.get("translit_address", "")).strip()
-                s1_addrs.append(f"{p} {t}" if (t and t != p) else p)
-
-            tgt_addrs: list[str] = []
-            for _, r in tgt_c.iterrows():
-                p = str(r.get("clean_address", r.get("business_address", ""))).strip()
-                t = str(r.get("translit_address", "")).strip()
-                tgt_addrs.append(f"{p} {t}" if (t and t != p) else p)
+            s1_names = _build_texts(s1_c, "soft_name", "business_name", "translit_name")
+            tgt_names = _build_texts(tgt_c, "soft_name", "business_name", "translit_name")
+            s1_addrs = _build_texts(s1_c, "clean_address", "business_address", "translit_address")
+            tgt_addrs = _build_texts(tgt_c, "clean_address", "business_address", "translit_address")
 
             # --- Channel A: Name Character 3-Gram TF-IDF ---
-            vec_name = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=1)
-            vec_name.fit(s1_names + tgt_names)
-
-            tgt_name_mat = vec_name.transform(tgt_names).T  # shape (vocab, n_tgt)
+            vec_name = TfidfVectorizer(
+                analyzer="char",
+                ngram_range=(3, 3),
+                min_df=1,
+                sublinear_tf=True,
+            )
+            tgt_name_mat = vec_name.fit_transform(tgt_names).T  # shape (vocab, n_tgt)
             tgt_ids = tgt_c["entity_id"].tolist()
 
-            for start_idx in range(0, len(s1_c), self.batch_size):
+            batch_ranges_name = list(range(0, len(s1_c), self.batch_size))
+            pbar_name = tqdm(
+                batch_ranges_name,
+                desc=f"  ⚡ Blocking [{country}|Name TF-IDF]",
+                unit="batch",
+                leave=False,
+                disable=not self.show_progress,
+            )
+            for start_idx in pbar_name:
                 end_idx = min(start_idx + self.batch_size, len(s1_c))
                 s1_batch_names = s1_names[start_idx:end_idx]
                 s1_batch_ids = s1_c["entity_id"].iloc[start_idx:end_idx].tolist()
 
                 batch_mat = vec_name.transform(s1_batch_names)
-                # Sparse dot product: (batch_size, n_tgt)
-                batch_sims = batch_mat.dot(tgt_name_mat).toarray()
+                # Pure sparse dot product: (batch_size, n_tgt)
+                batch_sims = batch_mat.dot(tgt_name_mat)
 
                 for i, s1_id in enumerate(s1_batch_ids):
-                    row_sims = batch_sims[i]
-                    top_indices = np.argsort(row_sims)[::-1][: self.name_top_k]
-                    for idx in top_indices:
-                        if row_sims[idx] >= self.name_min_sim:
-                            candidate_pairs[s1_id].add(tgt_ids[idx])
+                    r_start = batch_sims.indptr[i]
+                    r_end = batch_sims.indptr[i + 1]
+                    if r_start == r_end:
+                        continue
+                    scores = batch_sims.data[r_start:r_end]
+                    col_idx = batch_sims.indices[r_start:r_end]
+
+                    valid_mask = scores >= self.name_min_sim
+                    if not np.any(valid_mask):
+                        continue
+                    scores = scores[valid_mask]
+                    col_idx = col_idx[valid_mask]
+
+                    if len(scores) > self.name_top_k:
+                        top_sub = np.argpartition(scores, -self.name_top_k)[-self.name_top_k :]
+                        top_cols = col_idx[top_sub]
+                    else:
+                        top_cols = col_idx
+
+                    for c_idx in top_cols:
+                        candidate_pairs[s1_id].add(tgt_ids[c_idx])
 
             # --- Channel B: Address Character 3-Gram TF-IDF ---
-            # Filter non-empty address vocabulary
-            non_empty_addrs = [a for a in (s1_addrs + tgt_addrs) if a.strip()]
-            if non_empty_addrs:
-                vec_addr = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=1)
-                vec_addr.fit(non_empty_addrs)
+            if any(a.strip() for a in tgt_addrs):
+                min_df_addr = 2 if len(tgt_c) > 500 else 1
+                max_df_addr = 0.40 if len(tgt_c) > 500 else 1.0
+                vec_addr = TfidfVectorizer(
+                    analyzer="char",
+                    ngram_range=(3, 3),
+                    min_df=min_df_addr,
+                    max_df=max_df_addr,
+                    sublinear_tf=True,
+                )
+                tgt_addr_mat = vec_addr.fit_transform(tgt_addrs).T
 
-                tgt_addr_mat = vec_addr.transform(tgt_addrs).T
-
-                for start_idx in range(0, len(s1_c), self.batch_size):
+                batch_ranges_addr = list(range(0, len(s1_c), self.batch_size))
+                pbar_addr = tqdm(
+                    batch_ranges_addr,
+                    desc=f"  ⚡ Blocking [{country}|Addr TF-IDF]",
+                    unit="batch",
+                    leave=False,
+                    disable=not self.show_progress,
+                )
+                for start_idx in pbar_addr:
                     end_idx = min(start_idx + self.batch_size, len(s1_c))
                     s1_batch_addrs = s1_addrs[start_idx:end_idx]
                     s1_batch_ids = s1_c["entity_id"].iloc[start_idx:end_idx].tolist()
 
                     batch_mat = vec_addr.transform(s1_batch_addrs)
-                    batch_sims = batch_mat.dot(tgt_addr_mat).toarray()
+                    batch_sims = batch_mat.dot(tgt_addr_mat)
 
                     for i, s1_id in enumerate(s1_batch_ids):
                         if not s1_batch_addrs[i].strip():
                             continue
-                        row_sims = batch_sims[i]
-                        top_indices = np.argsort(row_sims)[::-1][: self.addr_top_k]
-                        for idx in top_indices:
-                            if row_sims[idx] >= self.addr_min_sim:
-                                candidate_pairs[s1_id].add(tgt_ids[idx])
+                        r_start = batch_sims.indptr[i]
+                        r_end = batch_sims.indptr[i + 1]
+                        if r_start == r_end:
+                            continue
+                        scores = batch_sims.data[r_start:r_end]
+                        col_idx = batch_sims.indices[r_start:r_end]
+
+                        valid_mask = scores >= self.addr_min_sim
+                        if not np.any(valid_mask):
+                            continue
+                        scores = scores[valid_mask]
+                        col_idx = col_idx[valid_mask]
+
+                        if len(scores) > self.addr_top_k:
+                            top_sub = np.argpartition(scores, -self.addr_top_k)[-self.addr_top_k :]
+                            top_cols = col_idx[top_sub]
+                        else:
+                            top_cols = col_idx
+
+                        for c_idx in top_cols:
+                            candidate_pairs[s1_id].add(tgt_ids[c_idx])
 
             # --- Channel C: Building Number Match with Leading Character Prefix ---
             if "numbers" in s1_c and "numbers" in tgt_c:
+                tgt_ids = tgt_c["entity_id"].astype(str).tolist()
+                tgt_names_ser = (
+                    tgt_c["soft_name"].fillna("").astype(str)
+                    if "soft_name" in tgt_c
+                    else tgt_c["business_name"].fillna("").astype(str)
+                )
+                tgt_prefixes = dict(zip(tgt_ids, tgt_names_ser.str[:2].tolist(), strict=False))
+
                 num_to_tgt: dict[str, list[str]] = defaultdict(list)
-                tgt_prefixes = {
-                    row["entity_id"]: str(row.get("soft_name", ""))[:2]
-                    for _, row in tgt_c.iterrows()
-                }
+                for eid, num_set in zip(tgt_ids, tgt_c["numbers"].tolist(), strict=False):
+                    for num in num_set:
+                        num_str = str(num)
+                        if len(num_str) >= 2:
+                            num_to_tgt[num_str].append(eid)
 
-                for _, row in tgt_c.iterrows():
-                    for num in row["numbers"]:
-                        num_to_tgt[num].append(row["entity_id"])
+                s1_ids = s1_c["entity_id"].astype(str).tolist()
+                s1_names_ser = (
+                    s1_c["soft_name"].fillna("").astype(str)
+                    if "soft_name" in s1_c
+                    else s1_c["business_name"].fillna("").astype(str)
+                )
+                s1_prefixes = s1_names_ser.str[:2].tolist()
 
-                for _, row in s1_c.iterrows():
-                    s1_id = row["entity_id"]
-                    s1_prefix = str(row.get("soft_name", ""))[:2]
-                    if not s1_prefix:
+                pbar_num = tqdm(
+                    zip(s1_ids, s1_prefixes, s1_c["numbers"].tolist(), strict=False),
+                    total=len(s1_ids),
+                    desc=f"  ⚡ Blocking [{country}|BldgNum]",
+                    unit="entity",
+                    leave=False,
+                    disable=not self.show_progress,
+                )
+                for s1_id, s1_pfx, num_set in pbar_num:
+                    if not s1_pfx:
                         continue
-                    for num in row["numbers"]:
-                        for cand_id in num_to_tgt.get(num, []):
-                            if tgt_prefixes.get(cand_id, "") == s1_prefix:
-                                candidate_pairs[s1_id].add(cand_id)
+                    for num in num_set:
+                        num_str = str(num)
+                        if len(num_str) < 2:
+                            continue
+                        cands = num_to_tgt.get(num_str, [])
+                        if len(cands) <= 50:
+                            for cand_id in cands:
+                                if tgt_prefixes.get(cand_id, "") == s1_pfx:
+                                    candidate_pairs[s1_id].add(cand_id)
+
+            if checkpoint_mgr is not None:
+                c_rows_s1: list[str] = []
+                c_rows_cand: list[str] = []
+                country_s1_ids = set(s1_c["entity_id"])
+                for s1_id in country_s1_ids:
+                    for cand_id in candidate_pairs.get(s1_id, ()):
+                        c_rows_s1.append(s1_id)
+                        c_rows_cand.append(cand_id)
+                df_country = pd.DataFrame({"s1_id": c_rows_s1, "cand_id": c_rows_cand})
+                checkpoint_mgr.save_dataframe(cp_key, df_country)
+                checkpoint_mgr.record_stage_completed(
+                    f"blocking_{country}",
+                    {"country": country, "pairs_count": len(df_country)},
+                )
 
         return candidate_pairs
 

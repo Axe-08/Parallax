@@ -18,9 +18,7 @@ from pydantic import BaseModel, Field
 class EvaluationReport(BaseModel):
     """Structured report of Macro F0.5 resolution performance."""
 
-    macro_f05: float = Field(
-        ..., description="Primary competition leaderboard metric: Macro F0.5"
-    )
+    macro_f05: float = Field(..., description="Primary competition leaderboard metric: Macro F0.5")
     singleton_score: float = Field(
         ..., description="Average score on singletons (should be close to 1.0)"
     )
@@ -158,6 +156,7 @@ def evaluate_blocking_candidates(
 
 # --- Legacy Metric Helpers for Backwards Compatibility ---
 
+
 def calculate_f1_score(
     y_true: Sequence[Any],
     y_pred: Sequence[Any],
@@ -165,6 +164,7 @@ def calculate_f1_score(
 ) -> float:
     """Calculate F1 score across classes (legacy)."""
     from sklearn.metrics import f1_score
+
     y_true_str = [str(x).strip() for x in y_true]
     y_pred_str = [str(x).strip() for x in y_pred]
     return float(f1_score(y_true_str, y_pred_str, average=average, zero_division=0.0))
@@ -189,6 +189,7 @@ def calculate_exact_match(
 ) -> float:
     """Calculate exact match ratio (legacy)."""
     from sklearn.metrics import accuracy_score
+
     y_true_norm = [str(x).strip().lower() for x in y_true]
     y_pred_norm = [str(x).strip().lower() for x in y_pred]
     return float(accuracy_score(y_true_norm, y_pred_norm))
@@ -210,4 +211,3 @@ def evaluate_predictions(
     except (ValueError, TypeError):
         pass
     return res
-

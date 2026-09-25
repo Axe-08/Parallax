@@ -82,9 +82,7 @@ class FailureRecord(BaseModel):
     )
     s1_name: str = Field(..., description="Source 1 business name")
     s1_address: str | None = Field(default=None, description="Source 1 address")
-    cand_name: str | None = Field(
-        default=None, description="Candidate business name if applicable"
-    )
+    cand_name: str | None = Field(default=None, description="Candidate business name if applicable")
     cand_address: str | None = Field(default=None, description="Candidate address if applicable")
     model_score: float | None = Field(
         default=None, description="Classifier probability or ranking score"

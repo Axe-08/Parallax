@@ -48,14 +48,16 @@ def test_number_extraction():
 
 
 def test_widen_records_df():
-    df = pd.DataFrame([
-        {
-            "entity_id": "S1-1",
-            "business_name": "Acme Robotics.com",
-            "business_address": "500 Market St, Suite 4",
-            "country": "US",
-        }
-    ])
+    df = pd.DataFrame(
+        [
+            {
+                "entity_id": "S1-1",
+                "business_name": "Acme Robotics.com",
+                "business_address": "500 Market St, Suite 4",
+                "country": "US",
+            }
+        ]
+    )
     widened = widen_records_df(df)
     assert "soft_name" in widened.columns
     assert widened.iloc[0]["soft_name"] == "acme robotics"

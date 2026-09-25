@@ -16,10 +16,10 @@ import unicodedata
 # Covers independent vowels, consonants, dependent matras, and special signs.
 _BRAHMIC_OFFSET_MAP: dict[int, str] = {
     # Modifiers
-    0x01: "n",   # Chandrabindu
-    0x02: "n",   # Anusvara
-    0x03: "h",   # Visarga
-    0x04: "",    # Short vowel / sign
+    0x01: "n",  # Chandrabindu
+    0x02: "n",  # Anusvara
+    0x03: "h",  # Visarga
+    0x04: "",  # Short vowel / sign
     # Independent vowels
     0x05: "a",
     0x06: "aa",
@@ -90,10 +90,10 @@ _BRAHMIC_OFFSET_MAP: dict[int, str] = {
     0x4A: "o",
     0x4B: "o",
     0x4C: "au",
-    0x4D: "",    # Virama / Halant (suppresses default vowel)
+    0x4D: "",  # Virama / Halant (suppresses default vowel)
     # Nukta / Extensions
-    0x3C: "",    # Nukta
-    0x58: "q",   # Urdu / Persianized consonants
+    0x3C: "",  # Nukta
+    0x58: "q",  # Urdu / Persianized consonants
     0x59: "kh",
     0x5A: "g",
     0x5B: "z",

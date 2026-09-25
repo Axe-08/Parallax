@@ -103,9 +103,12 @@ class LightGBMMatcher:
 
         for tau in search_range:
             preds: dict[str, set[str]] = {s1: set() for s1 in all_s1_ids}
-            filtered = df_eval[df_eval["prob"] >= tau]
-            for _, row in filtered.iterrows():
-                preds[str(row["s1_id"])].add(str(row["cand_id"]))
+            mask = probs >= tau
+            if np.any(mask):
+                s1_sub = df_eval["s1_id"].to_numpy()[mask]
+                cand_sub = df_eval["cand_id"].to_numpy()[mask]
+                for s1, cand in zip(s1_sub, cand_sub, strict=False):
+                    preds[str(s1)].add(str(cand))
 
             report = evaluate_resolution_predictions(val_gt, preds)
             if report.macro_f05 > best_score:
