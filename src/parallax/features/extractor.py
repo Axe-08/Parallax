@@ -68,22 +68,45 @@ class PairwiseFeatureExtractor:
 
                 cand_raw_name = str(cand_row.get("business_name", ""))
                 cand_soft_name = str(cand_row.get("soft_name", cand_raw_name.lower()))
+                cand_translit_name = str(cand_row.get("translit_name", cand_soft_name))
                 cand_addr = str(cand_row.get("clean_address", ""))
+                cand_translit_addr = str(cand_row.get("translit_address", cand_addr))
                 cand_nums = set(cand_row.get("numbers", set()))
                 cand_null = int(cand_row.get("is_addr_null", 0))
 
-                # Lexical Name Features
-                raw_ratio = fuzz.ratio(s1_raw_name, cand_raw_name) / 100.0
-                soft_ratio = fuzz.ratio(s1_soft_name, cand_soft_name) / 100.0
-                token_sort = fuzz.token_sort_ratio(s1_soft_name, cand_soft_name) / 100.0
-                token_set = fuzz.token_set_ratio(s1_soft_name, cand_soft_name) / 100.0
-                partial = fuzz.partial_ratio(s1_soft_name, cand_soft_name) / 100.0
+                # Lexical Name Features (Max across native and transliterated representations)
+                raw_ratio = max(
+                    fuzz.ratio(s1_raw_name, cand_raw_name),
+                    fuzz.ratio(s1_raw_name, cand_translit_name),
+                ) / 100.0
+                soft_ratio = max(
+                    fuzz.ratio(s1_soft_name, cand_soft_name),
+                    fuzz.ratio(s1_soft_name, cand_translit_name),
+                ) / 100.0
+                token_sort = max(
+                    fuzz.token_sort_ratio(s1_soft_name, cand_soft_name),
+                    fuzz.token_sort_ratio(s1_soft_name, cand_translit_name),
+                ) / 100.0
+                token_set = max(
+                    fuzz.token_set_ratio(s1_soft_name, cand_soft_name),
+                    fuzz.token_set_ratio(s1_soft_name, cand_translit_name),
+                ) / 100.0
+                partial = max(
+                    fuzz.partial_ratio(s1_soft_name, cand_soft_name),
+                    fuzz.partial_ratio(s1_soft_name, cand_translit_name),
+                ) / 100.0
 
                 # Address Alignment Features
                 both_present = 1 if (not s1_null and not cand_null and s1_addr and cand_addr) else 0
                 if both_present:
-                    addr_token_set = fuzz.token_set_ratio(s1_addr, cand_addr) / 100.0
-                    addr_ratio = fuzz.ratio(s1_addr, cand_addr) / 100.0
+                    addr_token_set = max(
+                        fuzz.token_set_ratio(s1_addr, cand_addr),
+                        fuzz.token_set_ratio(s1_addr, cand_translit_addr),
+                    ) / 100.0
+                    addr_ratio = max(
+                        fuzz.ratio(s1_addr, cand_addr),
+                        fuzz.ratio(s1_addr, cand_translit_addr),
+                    ) / 100.0
                 else:
                     addr_token_set = 0.0
                     addr_ratio = 0.0

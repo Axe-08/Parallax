@@ -15,6 +15,8 @@ import unicodedata
 
 import pandas as pd
 
+from parallax.preprocessing.transliteration import transliterate_brahmic_to_latin
+
 _DOMAIN_PATTERN = re.compile(
     r"\.(com|in|org|co|net|io|fr|gov|edu|biz|info)\b",
     re.IGNORECASE,
@@ -77,6 +79,14 @@ def clean_address(address: str | None) -> str:
     return " ".join(raw.split())
 
 
+def clean_transliterated_text(text: str | None) -> str:
+    """Produce normalized Latin phonetic string from potentially multilingual text."""
+    if not text or pd.isna(text):
+        return ""
+    translit = transliterate_brahmic_to_latin(str(text))
+    return clean_soft_name(translit)
+
+
 def widen_records_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add derived, parallel representation columns to a business records DataFrame
@@ -85,7 +95,9 @@ def widen_records_df(df: pd.DataFrame) -> pd.DataFrame:
     enriched = df.copy()
     enriched["soft_name"] = enriched["business_name"].apply(clean_soft_name)
     enriched["token_sorted_name"] = enriched["soft_name"].apply(get_token_sorted_name)
+    enriched["translit_name"] = enriched["business_name"].apply(clean_transliterated_text)
     enriched["clean_address"] = enriched["business_address"].apply(clean_address)
+    enriched["translit_address"] = enriched["business_address"].apply(clean_transliterated_text)
     enriched["numbers"] = enriched["business_address"].apply(extract_numbers)
     enriched["is_addr_null"] = enriched["business_address"].isna().astype(int)
     return enriched

@@ -28,10 +28,10 @@ class DualChannelTFIDFBlocker:
 
     def __init__(
         self,
-        name_top_k: int = 25,
-        addr_top_k: int = 20,
+        name_top_k: int = 35,
+        addr_top_k: int = 25,
         name_min_sim: float = 0.15,
-        addr_min_sim: float = 0.25,
+        addr_min_sim: float = 0.20,
         batch_size: int = 500,
     ) -> None:
         self.name_top_k = name_top_k
@@ -61,26 +61,30 @@ class DualChannelTFIDFBlocker:
             if len(s1_c) == 0 or len(tgt_c) == 0:
                 continue
 
-            # Ensure widening columns are present
-            if "soft_name" in s1_c:
-                s1_names = s1_c["soft_name"].tolist()
-            else:
-                s1_names = s1_c["business_name"].astype(str).tolist()
+            # Build dual-representation blocking texts (native + transliterated Latin)
+            s1_names: list[str] = []
+            for _, r in s1_c.iterrows():
+                p = str(r.get("soft_name", r.get("business_name", ""))).strip()
+                t = str(r.get("translit_name", "")).strip()
+                s1_names.append(f"{p} {t}" if (t and t != p) else p)
 
-            if "soft_name" in tgt_c:
-                tgt_names = tgt_c["soft_name"].tolist()
-            else:
-                tgt_names = tgt_c["business_name"].astype(str).tolist()
+            tgt_names: list[str] = []
+            for _, r in tgt_c.iterrows():
+                p = str(r.get("soft_name", r.get("business_name", ""))).strip()
+                t = str(r.get("translit_name", "")).strip()
+                tgt_names.append(f"{p} {t}" if (t and t != p) else p)
 
-            if "clean_address" in s1_c:
-                s1_addrs = s1_c["clean_address"].tolist()
-            else:
-                s1_addrs = s1_c["business_address"].fillna("").astype(str).tolist()
+            s1_addrs: list[str] = []
+            for _, r in s1_c.iterrows():
+                p = str(r.get("clean_address", r.get("business_address", ""))).strip()
+                t = str(r.get("translit_address", "")).strip()
+                s1_addrs.append(f"{p} {t}" if (t and t != p) else p)
 
-            if "clean_address" in tgt_c:
-                tgt_addrs = tgt_c["clean_address"].tolist()
-            else:
-                tgt_addrs = tgt_c["business_address"].fillna("").astype(str).tolist()
+            tgt_addrs: list[str] = []
+            for _, r in tgt_c.iterrows():
+                p = str(r.get("clean_address", r.get("business_address", ""))).strip()
+                t = str(r.get("translit_address", "")).strip()
+                tgt_addrs.append(f"{p} {t}" if (t and t != p) else p)
 
             # --- Channel A: Name Character 3-Gram TF-IDF ---
             vec_name = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=1)
