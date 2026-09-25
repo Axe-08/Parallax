@@ -529,19 +529,23 @@ def main() -> None:
     log("==> 6. Automated Failure Diagnostics & Error Analysis...")
     diag_logger = FailureDiagnosticsLogger(rep_path)
     val_s1_records = s1_wide[s1_wide["entity_id"].isin(val_s1)]
-    diag_logger.log_failures_from_predictions(
+    diag_logger.analyze_and_log_failures(
+        ground_truth=val_gt,
+        candidates=candidate_pairs,
+        predictions=val_preds,
+        scored_pairs_df=val_pairs,
         s1_df=val_s1_records,
         target_df=target_wide,
-        candidate_pairs=candidate_pairs,
-        predictions=val_preds,
-        ground_truth=val_gt,
-        scored_pairs_df=val_pairs,
+        report=eval_report,
     )
-    diag_report_path = diag_logger.generate_diagnostics_report(eval_report)
-    log(f"   ✓ Executive diagnostics written to: {diag_report_path}\n")
+    log(f"   ✓ Structured error logs written to: {rep_path / 'failures_v1.jsonl'}")
+    log(f"   ✓ Executive diagnostics report written to: {rep_path / 'diagnostics_v1.md'}\n")
 
     total_time = time.perf_counter() - start_total
     rss, peak, vms = get_memory_info()
+
+    prec = eval_report.total_correct_pairs / max(eval_report.total_predicted_pairs, 1)
+    rec = eval_report.total_correct_pairs / max(eval_report.total_true_pairs, 1)
 
     log("=" * 72)
     log("📊 KAGGLE EXECUTION & MEMORY SCORECARD")
@@ -551,9 +555,9 @@ def main() -> None:
     log(f"Kaggle 30 GB Headroom:        {30.0 - (peak / 1024):.2f} GB remaining")
     log(f"Total Candidate Pairs:        {total_candidates:,}")
     log(f"Validation Macro F0.5:        {eval_report.macro_f05:.4f}")
-    log(f"Validation Precision:         {eval_report.precision * 100:.2f}%")
-    log(f"Validation Recall:            {eval_report.recall * 100:.2f}%")
-    log(f"Singleton Accuracy:           {eval_report.singleton_accuracy * 100:.2f}%\n")
+    log(f"Validation Precision:         {prec * 100:.2f}%")
+    log(f"Validation Recall:            {rec * 100:.2f}%")
+    log(f"Singleton Accuracy:           {eval_report.singleton_score * 100:.2f}%\n")
 
     log("--- Sparse Matrix Dimensions & Sparsity ---")
     log(pd.DataFrame(sparse_matrix_stats).to_string(index=False))
