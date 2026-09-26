@@ -8,6 +8,7 @@ fine-grained address / name discrimination.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 import numpy as np
@@ -15,6 +16,8 @@ import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 from tqdm import tqdm
+
+from parallax.preprocessing.transliteration import has_brahmic_script
 
 FEATURE_COLUMNS = [
     # --- Retained Baseline Features (1-13) ---
@@ -52,6 +55,88 @@ FEATURE_COLUMNS = [
     "token_jaccard_addr",
 ]
 
+_HONORIFIC_PREFIX_REGEX = re.compile(
+    r"^(?:dr|prof|smt|shri|mr|ms|m\s+s)\b\s*",
+    re.IGNORECASE,
+)
+
+_SUFFIX_ORDERED_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Multi-token statutory entities (must match before single tokens)
+    (re.compile(r"\bprivate\s+limited$", re.IGNORECASE), "pvt_ltd"),
+    (re.compile(r"\bpvt\s+ltd$", re.IGNORECASE), "pvt_ltd"),
+    (re.compile(r"\blimited\s+liability\s+company$", re.IGNORECASE), "llc"),
+    (re.compile(r"\blimited\s+liability\s+partnership$", re.IGNORECASE), "llp"),
+    (re.compile(r"\bpublic\s+limited\s+company$", re.IGNORECASE), "plc"),
+    # Single-token statutory entities
+    (re.compile(r"\bllc$", re.IGNORECASE), "llc"),
+    (re.compile(r"\bllp$", re.IGNORECASE), "llp"),
+    (re.compile(r"\bpllc$", re.IGNORECASE), "pllc"),
+    (re.compile(r"\binc$", re.IGNORECASE), "inc"),
+    (re.compile(r"\bincorporated$", re.IGNORECASE), "inc"),
+    (re.compile(r"\bcorp$", re.IGNORECASE), "corp"),
+    (re.compile(r"\bcorporation$", re.IGNORECASE), "corp"),
+    (re.compile(r"\bltd$", re.IGNORECASE), "ltd"),
+    (re.compile(r"\blimited$", re.IGNORECASE), "ltd"),
+    (re.compile(r"\bcompany$", re.IGNORECASE), "co"),
+    (re.compile(r"\bco$", re.IGNORECASE), "co"),
+    (re.compile(r"\bpvt$", re.IGNORECASE), "pvt"),
+    (re.compile(r"\bprivate$", re.IGNORECASE), "pvt"),
+]
+
+
+def extract_core_and_suffix(soft_name: str) -> tuple[str, str | None]:
+    """
+    Extract canonical corporate legal suffix and strip prefixes/suffixes
+    to yield the core business brand name.
+
+    Safety:
+    - Never strips if the resulting core string has length < 2.
+    - Word-boundary matching prevents stripping within brand tokens (e.g. Zinc, Incite).
+    """
+    if not soft_name:
+        return "", None
+
+    # Standardize whitespace and remove any remaining punctuation (such as trailing dots in inc. or co.)
+    s = re.sub(r"[^\w\s]", " ", str(soft_name).lower())
+    s = " ".join(s.split())
+    if not s:
+        return "", None
+
+    # Strip leading honorifics / trade prefixes (e.g. "Dr", "M/s")
+    s = _HONORIFIC_PREFIX_REGEX.sub("", s).strip()
+
+    matched_suffix = None
+    for pattern, canon in _SUFFIX_ORDERED_PATTERNS:
+        if pattern.search(s):
+            matched_suffix = canon
+            stripped = pattern.sub("", s).strip()
+            # Safety guarantee: ensure we do not remove meaningful brand tokens
+            if len(stripped) >= 2:
+                s = stripped
+            break
+
+    if not s:
+        s = soft_name
+
+    return s, matched_suffix
+
+
+def check_is_cross_script(
+    has_brahmic1: bool,
+    text1: str,
+    has_brahmic2: bool,
+    text2: str,
+) -> float:
+    """Return 1.0 if pair spans different scripts (e.g. Latin vs Brahmic or different Brahmic scripts)."""
+    if has_brahmic1 != has_brahmic2:
+        return 1.0
+    if has_brahmic1 and has_brahmic2:
+        b1 = next((ord(c) // 0x80 for c in text1 if 0x0900 <= ord(c) <= 0x0D7F), None)
+        b2 = next((ord(c) // 0x80 for c in text2 if 0x0900 <= ord(c) <= 0x0D7F), None)
+        if b1 is not None and b2 is not None and b1 != b2:
+            return 1.0
+    return 0.0
+
 
 class PairwiseFeatureExtractor:
     """Extracts comparative similarity features for candidate pairs."""
@@ -87,6 +172,9 @@ class PairwiseFeatureExtractor:
                 set[str],  # name_toks
                 str,  # first_tok
                 set[str],  # addr_toks
+                str,  # core_name
+                str | None,  # suffix
+                bool,  # has_brahmic
             ],
         ]:
             raw_names = (
@@ -145,6 +233,8 @@ class PairwiseFeatureExtractor:
                 name_toks = set(sn_words)
                 first_tok = sn_words[0] if sn_words else ""
                 addr_toks = set(ca.split())
+                core_name, suffix = extract_core_and_suffix(sn)
+                has_brahmic = has_brahmic_script(rn)
 
                 lookup[eid] = (
                     rn,
@@ -160,6 +250,9 @@ class PairwiseFeatureExtractor:
                     name_toks,
                     first_tok,
                     addr_toks,
+                    core_name,
+                    suffix,
+                    has_brahmic,
                 )
             return lookup
 
@@ -176,7 +269,7 @@ class PairwiseFeatureExtractor:
         s1_id_list: list[str] = []
         cand_id_list: list[str] = []
 
-        # Preallocate all 28 feature arrays
+        # Preallocate all 34 feature arrays
         raw_ratio_arr = np.empty(total_pairs, dtype=np.float32)
         soft_ratio_arr = np.empty(total_pairs, dtype=np.float32)
         token_sort_arr = np.empty(total_pairs, dtype=np.float32)
@@ -191,7 +284,7 @@ class PairwiseFeatureExtractor:
         len_diff_arr = np.empty(total_pairs, dtype=np.float32)
         len_ratio_arr = np.empty(total_pairs, dtype=np.float32)
 
-        # 15 New features
+        # Group 1-4 features (14-28)
         primary_match_arr = np.empty(total_pairs, dtype=np.float32)
         primary_conflict_arr = np.empty(total_pairs, dtype=np.float32)
         primary_missing_arr = np.empty(total_pairs, dtype=np.float32)
@@ -207,6 +300,14 @@ class PairwiseFeatureExtractor:
         first_token_match_arr = np.empty(total_pairs, dtype=np.float32)
         canon_addr_ratio_arr = np.empty(total_pairs, dtype=np.float32)
         token_jaccard_addr_arr = np.empty(total_pairs, dtype=np.float32)
+
+        # Batch 1 features (29-34)
+        translit_boost_arr = np.empty(total_pairs, dtype=np.float32)
+        is_cross_script_arr = np.empty(total_pairs, dtype=np.float32)
+        translit_name_ratio_arr = np.empty(total_pairs, dtype=np.float32)
+        name_core_ratio_arr = np.empty(total_pairs, dtype=np.float32)
+        suffix_match_arr = np.empty(total_pairs, dtype=np.float32)
+        s1_cand_count_arr = np.empty(total_pairs, dtype=np.float32)
 
         target_arr = np.empty(total_pairs, dtype=np.int8) if ground_truth is not None else None
 
@@ -227,7 +328,7 @@ class PairwiseFeatureExtractor:
             (
                 s1_raw_name,
                 s1_soft_name,
-                _,
+                s1_translit_name,
                 s1_addr,
                 _,
                 s1_nums,
@@ -238,9 +339,13 @@ class PairwiseFeatureExtractor:
                 s1_name_toks,
                 s1_first_tok,
                 s1_addr_toks,
+                s1_core_name,
+                s1_suffix,
+                s1_has_brahmic,
             ) = s1_row
 
             true_matches = ground_truth.get(s1_id, set()) if ground_truth else None
+            cand_count_val = float(len(cands))
 
             for cand_id in cands:
                 cand_row = target_dict.get(cand_id)
@@ -261,6 +366,9 @@ class PairwiseFeatureExtractor:
                     cand_name_toks,
                     cand_first_tok,
                     cand_addr_toks,
+                    cand_core_name,
+                    cand_suffix,
+                    cand_has_brahmic,
                 ) = cand_row
 
                 # --- 1-5: Lexical Name Features ---
@@ -271,13 +379,14 @@ class PairwiseFeatureExtractor:
                     )
                     / 100.0
                 )
-                soft_ratio_arr[idx] = (
-                    max(
-                        fuzz.ratio(s1_soft_name, cand_soft_name),
-                        fuzz.ratio(s1_soft_name, cand_translit_name),
-                    )
-                    / 100.0
+                soft_ratio_unnorm = fuzz.ratio(s1_soft_name, cand_soft_name)
+                cand_translit_unnorm = (
+                    fuzz.ratio(s1_soft_name, cand_translit_name)
+                    if cand_has_brahmic
+                    else soft_ratio_unnorm
                 )
+                max_soft_unnorm = max(soft_ratio_unnorm, cand_translit_unnorm)
+                soft_ratio_arr[idx] = max_soft_unnorm / 100.0
                 token_sort_arr[idx] = (
                     max(
                         fuzz.token_sort_ratio(s1_soft_name, cand_soft_name),
@@ -426,6 +535,41 @@ class PairwiseFeatureExtractor:
                 else:
                     canon_addr_ratio_arr[idx] = 0.0
                     token_jaccard_addr_arr[idx] = 0.0
+
+                # --- 29-31: Cross-Script & Transliteration Signals ---
+                translit_boost_arr[idx] = max(
+                    0.0, float(max_soft_unnorm - soft_ratio_unnorm) / 100.0
+                )
+                is_cross_script_arr[idx] = check_is_cross_script(
+                    s1_has_brahmic, s1_raw_name, cand_has_brahmic, cand_raw_name
+                )
+                if not s1_has_brahmic and not cand_has_brahmic:
+                    translit_name_ratio_arr[idx] = soft_ratio_unnorm / 100.0
+                else:
+                    translit_name_ratio_arr[idx] = (
+                        fuzz.ratio(s1_translit_name, cand_translit_name) / 100.0
+                    )
+
+                # --- 32-33: Corporate Entity Designators & Core Name ---
+                if s1_core_name == s1_soft_name and cand_core_name == cand_soft_name:
+                    name_core_ratio_arr[idx] = soft_ratio_unnorm / 100.0
+                else:
+                    name_core_ratio_arr[idx] = (
+                        fuzz.ratio(s1_core_name, cand_core_name) / 100.0
+                    )
+
+                if s1_suffix and cand_suffix:
+                    if s1_suffix == cand_suffix:
+                        suffix_match_arr[idx] = 1.0
+                    elif {s1_suffix, cand_suffix} == {"pvt_ltd", "ltd"}:
+                        suffix_match_arr[idx] = 0.5
+                    else:
+                        suffix_match_arr[idx] = 0.0
+                else:
+                    suffix_match_arr[idx] = 0.5
+
+                # --- 34: Candidate Pool Context ---
+                s1_cand_count_arr[idx] = cand_count_val
 
                 s1_id_list.append(s1_id)
                 cand_id_list.append(cand_id)

@@ -1,0 +1,86 @@
+============================================================
+PHASE 2 - KNOWN FAILURE AUDIT (Found 6 BFNs)
+============================================================
+S1: S1-322655095 | Cand: S3-431613812
+S1 Raw: Silver Global Pvt Ltd
+C Raw:  ಸಿಲ್ವರ್ ಗ್ಲೋಬಲ್ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್
+S1 Translit: silver global pvt ltd
+C Translit:  silvr globl praivet limited
+Combined TFIDF Sim: 0.2352 | Rank: 105
+Translit TFIDF Sim: 0.4865 | Rank: 18
+=> WOULD RECOVER under translit channel.
+----------------------------------------
+S1: S1-239689667 | Cand: S3-908361786
+S1 Raw: South Exports Private Limited
+C Raw:  South एक्सपोर्ट्स प्राइवेट लिमिटेड
+S1 Translit: south exports private limited
+C Translit:  south eksports praaivet limited
+Combined TFIDF Sim: 0.4676 | Rank: 26
+Translit TFIDF Sim: 0.6150 | Rank: 4
+=> WOULD RECOVER under translit channel.
+----------------------------------------
+S1: S1-475902695 | Cand: S2-790228837
+S1 Raw: Shiv Indian Producer Private Limited
+C Raw:  Shiv Indian પ્રોડ્યુસર પ્રાઇવેટ લિમિટેડ
+S1 Translit: shiv indian producer private limited
+C Translit:  shiv indian prodyusr praaivet limited
+Combined TFIDF Sim: 0.4446 | Rank: 26
+Translit TFIDF Sim: 0.6051 | Rank: 6
+=> WOULD RECOVER under translit channel.
+----------------------------------------
+S1: S1-928416101 | Cand: S3-506152275
+S1 Raw: Surya Developers Private Limited
+C Raw:  সূর্য ডেভেলপারস প্রাইভেট লিমিটেড
+S1 Translit: surya developers private limited
+C Translit:  suury debhelpaars praaibhet limited
+Combined TFIDF Sim: 0.0938 | Rank: 2263
+Translit TFIDF Sim: 0.1586 | Rank: 430
+=> WOULD NOT RECOVER (or requires lower threshold/higher K).
+----------------------------------------
+S1: S1-236609369 | Cand: S3-427612017
+S1 Raw: Hotel Producer Pvt Ltd
+C Raw:  होटल प्रोड्यूसर प्रा. लि.
+S1 Translit: hotel producer pvt ltd
+C Translit:  hotl prodyuusr praa. li.
+Combined TFIDF Sim: 0.1510 | Rank: 388
+Translit TFIDF Sim: 0.2432 | Rank: 188
+=> WOULD NOT RECOVER (or requires lower threshold/higher K).
+----------------------------------------
+S1: S1-775681739 | Cand: S3-958637250
+S1 Raw: High Estate Private Limited
+C Raw:  हाई एस्टेट प्राइवेट लिमिटेड
+S1 Translit: high estate private limited
+C Translit:  haaii estet praaivet limited
+Combined TFIDF Sim: 0.1148 | Rank: 2027
+Translit TFIDF Sim: 0.2041 | Rank: 214
+=> WOULD NOT RECOVER (or requires lower threshold/higher K).
+----------------------------------------
+
+============================================================
+PHASE 3 - BLOCKING EVALUATION (Baseline vs B1)
+============================================================
+Metric                    | Baseline        | Experiment B1  
+------------------------------------------------------------
+Total Candidate Pairs     | 40,402          | 40,492         
+Avg Candidates / S1       | 40.40           | 40.49          
+Med Candidates / S1       | 42              | 42             
+P90 Candidates / S1       | 44              | 44             
+P99 Candidates / S1       | 46              | 47             
+Cross-Script GT Pairs     | 235             | 235            
+Cross-Script BFNs         | 6               | 3              
+Cross-Script Recall       | 97.45         % | 98.72         %
+
+============================================================
+END-TO-END TEST (Model A on Candidate Sets)
+============================================================
+Metric                    | Baseline E2E    | Experiment B1  
+------------------------------------------------------------
+Macro F0.5                | 0.9892          | 0.9894         
+Precision                 | 0.9946          | 0.9946         
+Recall                    | 0.9772          | 0.9781         
+Singleton Accuracy        | 1.0000          | 1.0000         
+Predicted Pairs           | 3321            | 3324           
+Classification FNs        | 66              | 66             
+Blocking FNs              | 11              | 8              
+False Merges              | 18              | 18             
+Singleton Violations      | 0               | 0              

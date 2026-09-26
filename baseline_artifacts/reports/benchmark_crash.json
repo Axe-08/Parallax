@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-09-26T11:45:28.251022+00:00",
+  "error_type": "UnicodeEncodeError",
+  "error_message": "'charmap' codec can't encode character '\\U0001f680' in position 0: character maps to <undefined>",
+  "active_stage": "INITIALIZATION",
+  "traceback": "Traceback (most recent call last):\n  File \"D:\\ML Challange\\Parallax\\scripts\\run_medium_benchmark.py\", line 15, in <module>\n    main()\n  File \"D:\\ML Challange\\Parallax\\src\\parallax\\experiments\\runner.py\", line 734, in main\n    run_benchmark(\n  File \"D:\\ML Challange\\Parallax\\src\\parallax\\experiments\\runner.py\", line 506, in run_benchmark\n    print_banner(\"PARALLAX 200K BENCHMARK & ERROR DIAGNOSTICS SUITE\")\n  File \"D:\\ML Challange\\Parallax\\src\\parallax\\experiments\\runner.py\", line 86, in print_banner\n    print(f\"🚀 {title}\")\n  File \"C:\\Users\\karti\\AppData\\Roaming\\uv\\python\\cpython-3.12-windows-x86_64-none\\Lib\\encodings\\cp1252.py\", line 19, in encode\n    return codecs.charmap_encode(input,self.errors,encoding_table)[0]\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nUnicodeEncodeError: 'charmap' codec can't encode character '\\U0001f680' in position 0: character maps to <undefined>\n",
+  "resources": {
+    "rss_mb": 0.0,
+    "virtual_mb": 0.0,
+    "system_ram_used_gb": 8.0,
+    "system_ram_total_gb": 16.0,
+    "system_ram_percent": 50.0,
+    "swap_used_gb": 0.0,
+    "swap_free_gb": 0.0,
+    "disk_free_gb": 235.39
+  }
+}

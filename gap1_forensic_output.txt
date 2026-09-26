@@ -1,0 +1,227 @@
+============================================================
+PHASE 2 - SEPARATE BLOCKING FNS FROM CLASSIFICATION FNS (CROSS-SCRIPT)
+============================================================
+Total cross-script true matches: 235
+Cross-script True Positives:     210
+Cross-script Classification FNs: 19
+Cross-script Blocking FNs:       6
+Cross-script recall at blocking: 97.45%
+Cross-script recall after clf:   89.36%
+
+============================================================
+PHASE 1 - FORENSIC TRACE (REPRESENTATIVE SAMPLE)
+============================================================
+=== CROSS-SCRIPT CLASSIFICATION FNs ===
+S1: S1-687181195 | Cand: S3-905775328
+Status: CLASSIFICATION_FN | Prob: 0.1893
+Raw Name:      Sun Enterprises LLP  <->  சன் எண்டர்பிரைசஸ் எல்எல்பி
+Soft Name:     sun enterprises llp  <->  சன் எண்டர்பிரைசஸ் எல்எல்பி
+Translit Name: sun enterprises llp  <->  ch entrpiraichs elelpi
+--- Name Features ---
+  soft_name_ratio:    0.6341
+  translit_name_ratio:0.6341 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.3902
+  jaro_winkler_soft:  0.7127
+--- Address Features ---
+  addr_ratio:         0.4222
+  token_jaccard_addr: 0.2500
+----------------------------------------
+S1: S1-380345037 | Cand: S3-248289248
+Status: CLASSIFICATION_FN | Prob: 0.0383
+Raw Name:      Blue Ventures Private Limited  <->  ब्लू वेंचर्स प्राइवेट लिमिटेड
+Soft Name:     blue ventures private limited  <->  ब्लू वेंचर्स प्राइवेट लिमिटेड
+Translit Name: blue ventures private limited  <->  bluu venchrs praaivet limited
+--- Name Features ---
+  soft_name_ratio:    0.7931
+  translit_name_ratio:0.7931 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.7931
+  jaro_winkler_soft:  0.8799
+--- Address Features ---
+  addr_ratio:         0.5085
+  token_jaccard_addr: 0.2222
+----------------------------------------
+S1: S1-52324596 | Cand: S2-813365120
+Status: CLASSIFICATION_FN | Prob: 0.0999
+Raw Name:      Eastern Construction Pvt Ltd  <->  ইস্টার্ন কনস্ট্রাকশন প্রাইভেট লিমিটেড
+Soft Name:     eastern construction pvt ltd  <->  ইস্টার্ন কনস্ট্রাকশন প্রাইভেট লিমিটেড
+Translit Name: eastern construction pvt ltd  <->  istaarn knstraakshn praaibhet limited
+--- Name Features ---
+  soft_name_ratio:    0.5231
+  translit_name_ratio:0.5231 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.4923
+  jaro_winkler_soft:  0.5903
+--- Address Features ---
+  addr_ratio:         0.8542
+  token_jaccard_addr: 0.6364
+----------------------------------------
+S1: S1-432522433 | Cand: S3-908606391
+Status: CLASSIFICATION_FN | Prob: 0.1684
+Raw Name:      High Products Private Limited  <->  হাই প্রোডাক্টস প্রাইভেট লিমিটেড
+Soft Name:     high products private limited  <->  হাই প্রোডাক্টস প্রাইভেট লিমিটেড
+Translit Name: high products private limited  <->  haai prodaakts praaibhet limited
+--- Name Features ---
+  soft_name_ratio:    0.7213
+  translit_name_ratio:0.7213 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.7213
+  jaro_winkler_soft:  0.8233
+--- Address Features ---
+  addr_ratio:         0.5474
+  token_jaccard_addr: 0.2857
+----------------------------------------
+S1: S1-163872114 | Cand: S2-736882000
+Status: CLASSIFICATION_FN | Prob: 0.1350
+Raw Name:      Sree Star Food Private Limited  <->  ശ്രീ സ്റ്റാർ ഫുഡ് പ്രൈവറ്റ് ലിമിറ്റഡ്
+Soft Name:     sree star food private limited  <->  ശ്രീ സ്റ്റാർ ഫുഡ് പ്രൈവറ്റ് ലിമിറ്റഡ്
+Translit Name: sree star food private limited  <->  shrii srraa phud praivrr limirrd
+--- Name Features ---
+  soft_name_ratio:    0.5806
+  translit_name_ratio:0.5806 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.5161
+  jaro_winkler_soft:  0.6306
+--- Address Features ---
+  addr_ratio:         0.9457
+  token_jaccard_addr: 0.5000
+----------------------------------------
+=== CROSS-SCRIPT BLOCKING FNs ===
+S1: S1-322655095 | Cand: S3-431613812
+Status: BLOCKING_FN | Prob: 0.0000
+Raw Name:      Silver Global Pvt Ltd  <->  ಸಿಲ್ವರ್ ಗ್ಲೋಬಲ್ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್
+Soft Name:     silver global pvt ltd  <->  ಸಿಲ್ವರ್ ಗ್ಲೋಬಲ್ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್
+Translit Name: silver global pvt ltd  <->  silvr globl praivet limited
+--- Name Features (Manual Compute) ---
+  soft_name_ratio:    0.1111
+  translit_name_ratio:0.7917
+  raw_name_ratio:     0.6250
+----------------------------------------
+S1: S1-239689667 | Cand: S3-908361786
+Status: BLOCKING_FN | Prob: 0.0000
+Raw Name:      South Exports Private Limited  <->  South एक्सपोर्ट्स प्राइवेट लिमिटेड
+Soft Name:     south exports private limited  <->  south एक्सपोर्ट्स प्राइवेट लिमिटेड
+Translit Name: south exports private limited  <->  south eksports praaivet limited
+--- Name Features (Manual Compute) ---
+  soft_name_ratio:    0.2540
+  translit_name_ratio:0.8667
+  raw_name_ratio:     0.7333
+----------------------------------------
+S1: S1-475902695 | Cand: S2-790228837
+Status: BLOCKING_FN | Prob: 0.0000
+Raw Name:      Shiv Indian Producer Private Limited  <->  Shiv Indian પ્રોડ્યુસર પ્રાઇવેટ લિમિટેડ
+Soft Name:     shiv indian producer private limited  <->  shiv indian પ્રોડ્યુસર પ્રાઇવેટ લિમિટેડ
+Translit Name: shiv indian producer private limited  <->  shiv indian prodyusr praaivet limited
+--- Name Features (Manual Compute) ---
+  soft_name_ratio:    0.3733
+  translit_name_ratio:0.8767
+  raw_name_ratio:     0.7397
+----------------------------------------
+S1: S1-928416101 | Cand: S3-506152275
+Status: BLOCKING_FN | Prob: 0.0000
+Raw Name:      Surya Developers Private Limited  <->  সূর্য ডেভেলপারস প্রাইভেট লিমিটেড
+Soft Name:     surya developers private limited  <->  সূর্য ডেভেলপারস প্রাইভেট লিমিটেড
+Translit Name: surya developers private limited  <->  suury debhelpaars praaibhet limited
+--- Name Features (Manual Compute) ---
+  soft_name_ratio:    0.0938
+  translit_name_ratio:0.7463
+  raw_name_ratio:     0.6269
+----------------------------------------
+S1: S1-236609369 | Cand: S3-427612017
+Status: BLOCKING_FN | Prob: 0.0000
+Raw Name:      Hotel Producer Pvt Ltd  <->  होटल प्रोड्यूसर प्रा. लि.
+Soft Name:     hotel producer pvt ltd  <->  होटल प्रोड्यूसर प्रा. लि.
+Translit Name: hotel producer pvt ltd  <->  hotl prodyuusr praa. li.
+--- Name Features (Manual Compute) ---
+  soft_name_ratio:    0.1277
+  translit_name_ratio:0.6522
+  raw_name_ratio:     0.4783
+----------------------------------------
+=== CROSS-SCRIPT TRUE POSITIVES ===
+S1: S1-487235070 | Cand: S2-273083163
+Status: TRUE_POSITIVE | Prob: 0.9987
+Raw Name:      International Ventures Private Limited  <->  इंटरनेशनल वेंचर्स प्राइवेट लिमिटेड
+Soft Name:     international ventures private limited  <->  इंटरनेशनल वेंचर्स प्राइवेट लिमिटेड
+Translit Name: international ventures private limited  <->  intrneshnl venchrs praaivet limited
+--- Name Features ---
+  soft_name_ratio:    0.7397
+  translit_name_ratio:0.7397 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.7397
+  jaro_winkler_soft:  0.8325
+--- Address Features ---
+  addr_ratio:         0.9565
+  token_jaccard_addr: 0.8235
+----------------------------------------
+S1: S1-487235070 | Cand: S3-436199207
+Status: TRUE_POSITIVE | Prob: 0.9987
+Raw Name:      International Ventures Private Limited  <->  इंटरनेशनल वेंचर्स प्राइवेट लिमिटेड
+Soft Name:     international ventures private limited  <->  इंटरनेशनल वेंचर्स प्राइवेट लिमिटेड
+Translit Name: international ventures private limited  <->  intrneshnl venchrs praaivet limited
+--- Name Features ---
+  soft_name_ratio:    0.7397
+  translit_name_ratio:0.7397 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.7397
+  jaro_winkler_soft:  0.8325
+--- Address Features ---
+  addr_ratio:         0.9143
+  token_jaccard_addr: 0.7778
+----------------------------------------
+S1: S1-354906740 | Cand: S2-297468141
+Status: TRUE_POSITIVE | Prob: 0.9990
+Raw Name:      Pioneer Impex Private Limited  <->  பயனியர் இம்பெக்ஸ் பிரைவேட் லிமிடெட்
+Soft Name:     pioneer impex private limited  <->  பயனியர் இம்பெக்ஸ் பிரைவேட் லிமிடெட்
+Translit Name: pioneer impex private limited  <->  pyiyr impeks piraivet limitet
+--- Name Features ---
+  soft_name_ratio:    0.7241
+  translit_name_ratio:0.7241 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.6207
+  jaro_winkler_soft:  0.7715
+--- Address Features ---
+  addr_ratio:         0.4615
+  token_jaccard_addr: 0.5455
+----------------------------------------
+=== NON-CROSS-SCRIPT TRUE POSITIVES (CONTROL) ===
+S1: S1-538808124 | Cand: S2-690740250
+Status: TRUE_POSITIVE | Prob: 0.9995
+Raw Name:      D+ Reit, Inc  <->  D+ Reit, Inc
+Soft Name:     d+ reit inc  <->  d+ reit inc
+Translit Name: d+ reit inc  <->  d+ reit inc
+--- Name Features ---
+  soft_name_ratio:    1.0000
+  translit_name_ratio:1.0000 (Not in Model A, but useful to see)
+  token_sort_ratio:   1.0000
+  jaro_winkler_soft:  1.0000
+--- Address Features ---
+  addr_ratio:         0.9545
+  token_jaccard_addr: 1.0000
+----------------------------------------
+S1: S1-538808124 | Cand: S2-842661245
+Status: TRUE_POSITIVE | Prob: 0.9992
+Raw Name:      D+ Reit, Inc  <->  D+ Reit Inc
+Soft Name:     d+ reit inc  <->  d+ reit inc
+Translit Name: d+ reit inc  <->  d+ reit inc
+--- Name Features ---
+  soft_name_ratio:    1.0000
+  translit_name_ratio:1.0000 (Not in Model A, but useful to see)
+  token_sort_ratio:   1.0000
+  jaro_winkler_soft:  1.0000
+--- Address Features ---
+  addr_ratio:         0.9545
+  token_jaccard_addr: 0.8000
+----------------------------------------
+S1: S1-538808124 | Cand: S2-959493821
+Status: TRUE_POSITIVE | Prob: 0.9995
+Raw Name:      D+ Reit, Inc  <->  D+ Reit, Inc.
+Soft Name:     d+ reit inc  <->  d+ reit inc.
+Translit Name: d+ reit inc  <->  d+ reit inc.
+--- Name Features ---
+  soft_name_ratio:    0.9565
+  translit_name_ratio:0.9565 (Not in Model A, but useful to see)
+  token_sort_ratio:   0.9565
+  jaro_winkler_soft:  0.9833
+--- Address Features ---
+  addr_ratio:         1.0000
+  token_jaccard_addr: 1.0000
+----------------------------------------
+
+============================================================
+PHASE 3 - DIAGNOSING THE REPRESENTATION FAILURE
+============================================================
+Mean translit_ratio for Cross-Script CFNs: 0.6884
+Mean translit_ratio for Cross-Script TPs:  0.7561

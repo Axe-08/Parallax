@@ -107,8 +107,6 @@ def generate_or_load_candidates(
     s1_wide: pd.DataFrame,
     target_wide: pd.DataFrame,
     cache_path: Path,
-    blocker_top_k: int = 35,
-    blocker_min_sim: float = 0.15,
     checkpoint_mgr: CheckpointManager | None = None,
 ) -> dict[str, set[str]]:
     """Generate or retrieve candidate pairs mapping s1_id -> set of candidate entity_ids."""
@@ -125,19 +123,17 @@ def generate_or_load_candidates(
         print(f"  ✓ Loaded {len(cands_df):,} cached pairs in {time.time() - t0:.2f}s.\n")
         return candidates
 
-    msg = (
-        f"  ⚡ Running sparse TF-IDF blocker (top_k={blocker_top_k}, min_sim={blocker_min_sim})..."
-    )
-    print(msg)
-    t0 = time.time()
     blocker = DualChannelTFIDFBlocker(
-        name_top_k=blocker_top_k,
-        addr_top_k=25,
-        name_min_sim=blocker_min_sim,
-        addr_min_sim=0.20,
         batch_size=2000,
         show_progress=True,
     )
+    msg = (
+        f"  ⚡ Running sparse TF-IDF blocker "
+        f"(name_top_k={blocker.name_top_k}, addr_top_k={blocker.addr_top_k}, "
+        f"translit_top_k={blocker.translit_top_k}, translit_min_sim={blocker.translit_min_sim})..."
+    )
+    print(msg)
+    t0 = time.time()
     candidates = blocker.generate_candidates(s1_wide, target_wide, checkpoint_mgr=checkpoint_mgr)
 
     elapsed = time.time() - t0

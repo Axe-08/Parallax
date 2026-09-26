@@ -1,0 +1,13 @@
+{
+  "dataset_name": "medium_split_200k",
+  "updated_at": "2026-09-26T11:46:14.490490+00:00",
+  "completed_stages": [
+    "widening"
+  ],
+  "metadata": {
+    "widening": {
+      "s1_rows": 5000,
+      "target_rows": 1000000
+    }
+  }
+}

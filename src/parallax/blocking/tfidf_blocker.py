@@ -33,9 +33,9 @@ class DualChannelTFIDFBlocker:
 
     def __init__(
         self,
-        name_top_k: int = 35,
-        addr_top_k: int = 25,
-        translit_top_k: int = 5,
+        name_top_k: int = 25,
+        addr_top_k: int = 20,
+        translit_top_k: int = 0,
         name_min_sim: float = 0.15,
         addr_min_sim: float = 0.20,
         translit_min_sim: float = 0.30,
@@ -66,27 +66,29 @@ class DualChannelTFIDFBlocker:
         # Process each country partition independently
         countries = s1_df["country"].unique()
 
-        def _build_texts(
-            df: pd.DataFrame, primary_col: str, fallback_col: str, translit_col: str
-        ) -> list[str]:
-            if primary_col in df:
-                p_s = df[primary_col].fillna("").astype(str).str.strip()
-                if fallback_col in df:
+        def _get_native_names(df: pd.DataFrame) -> list[str]:
+            """Channel A: native/soft name only. No transliteration concatenation."""
+            if "soft_name" in df:
+                p_s = df["soft_name"].fillna("").astype(str).str.strip()
+                if "business_name" in df:
                     empty = p_s == ""
                     if empty.any():
-                        p_s[empty] = df.loc[empty, fallback_col].fillna("").astype(str).str.strip()
-            elif fallback_col in df:
-                p_s = df[fallback_col].fillna("").astype(str).str.strip()
+                        p_s = p_s.copy()
+                        p_s[empty] = df.loc[empty, "business_name"].fillna("").astype(str).str.strip()
+            elif "business_name" in df:
+                p_s = df["business_name"].fillna("").astype(str).str.strip()
             else:
                 p_s = pd.Series([""] * len(df), index=df.index)
+            return [str(x) for x in p_s.tolist()]
 
-            if translit_col in df:
-                t_s = df[translit_col].fillna("").astype(str).str.strip()
-                diff_mask = (t_s != "") & (t_s != p_s)
-                res = p_s.copy()
-                if diff_mask.any():
-                    res[diff_mask] = p_s[diff_mask] + " " + t_s[diff_mask]
-                return [str(x) for x in res.tolist()]
+        def _get_native_addrs(df: pd.DataFrame) -> list[str]:
+            """Channel B: clean address only. No transliteration concatenation."""
+            if "clean_address" in df:
+                p_s = df["clean_address"].fillna("").astype(str).str.strip()
+            elif "business_address" in df:
+                p_s = df["business_address"].fillna("").astype(str).str.strip()
+            else:
+                p_s = pd.Series([""] * len(df), index=df.index)
             return [str(x) for x in p_s.tolist()]
 
         for country in countries:
@@ -109,11 +111,12 @@ class DualChannelTFIDFBlocker:
             if len(s1_c) == 0 or len(tgt_c) == 0:
                 continue
 
-            # Build dual-representation blocking texts (native + transliterated Latin)
-            s1_names = _build_texts(s1_c, "soft_name", "business_name", "translit_name")
-            tgt_names = _build_texts(tgt_c, "soft_name", "business_name", "translit_name")
-            s1_addrs = _build_texts(s1_c, "clean_address", "business_address", "translit_address")
-            tgt_addrs = _build_texts(tgt_c, "clean_address", "business_address", "translit_address")
+            # Channel A: native name only (no translit). Channel D handles translit independently.
+            s1_names = _get_native_names(s1_c)
+            tgt_names = _get_native_names(tgt_c)
+            # Channel B: clean address only (no translit).
+            s1_addrs = _get_native_addrs(s1_c)
+            tgt_addrs = _get_native_addrs(tgt_c)
 
             # --- Channel A: Name Character 3-Gram TF-IDF ---
             vec_name = TfidfVectorizer(
