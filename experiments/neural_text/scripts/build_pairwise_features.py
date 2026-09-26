@@ -219,6 +219,7 @@ def build_augmented_features(
     candidates_path: Path | None = None,
     ground_truth_path: Path | None = None,
     s1_limit: int | None = 5000,
+    chunk_size: int = 250_000,
 ) -> pd.DataFrame:
     """
     Read baseline features (or generate if missing), attach neural pairwise features, and validate integrity.

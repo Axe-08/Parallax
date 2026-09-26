@@ -295,8 +295,21 @@ def generate_experiment_report(
     # Feature correlations
     tp_df = augmented_df[augmented_df["target"] == 1]
     rho_qwen_soft, _ = pearsonr(tp_df["qwen_name_cosine"], tp_df["soft_name_ratio"])
-    rho_ix_soft, _ = pearsonr(tp_df["indicxlit_name_similarity"], tp_df["soft_name_ratio"])
-    rho_qwen_ix, _ = pearsonr(tp_df["qwen_name_cosine"], tp_df["indicxlit_name_similarity"])
+
+    # Filter to positive pairs where Indic transliteration was applicable (non-NaN)
+    ix_mask = tp_df["indicxlit_name_similarity"].notna()
+    if ix_mask.sum() > 2:
+        rho_ix_soft, _ = pearsonr(
+            tp_df.loc[ix_mask, "indicxlit_name_similarity"],
+            tp_df.loc[ix_mask, "soft_name_ratio"],
+        )
+        rho_qwen_ix, _ = pearsonr(
+            tp_df.loc[ix_mask, "qwen_name_cosine"],
+            tp_df.loc[ix_mask, "indicxlit_name_similarity"],
+        )
+    else:
+        rho_ix_soft = 0.0
+        rho_qwen_ix = 0.0
 
     e0 = results[0]
 
