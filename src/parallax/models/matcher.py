@@ -32,6 +32,7 @@ class LightGBMMatcher:
         scale_pos_weight: float = 3.0,
         feature_columns: Sequence[str] | None = None,
         seed: int = 42,
+        num_threads: int | None = None,
     ) -> None:
         self.learning_rate = learning_rate
         self.num_leaves = num_leaves
@@ -43,6 +44,7 @@ class LightGBMMatcher:
             list(feature_columns) if feature_columns is not None else list(FEATURE_COLUMNS)
         )
         self.seed = seed
+        self.num_threads = num_threads
         self.model: lgb.Booster | None = None
 
     def train(
@@ -72,6 +74,8 @@ class LightGBMMatcher:
             "subsample": 0.9,
             "subsample_freq": 1,
         }
+        if self.num_threads is not None and self.num_threads > 0:
+            params["num_threads"] = self.num_threads
 
         valid_sets = [train_data]
         if val_df is not None:

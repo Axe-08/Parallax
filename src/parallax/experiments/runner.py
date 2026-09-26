@@ -383,6 +383,133 @@ def run_sweep(
     return best_sweep.config, best_sweep.optimal_tau
 
 
+def evaluate_single_fold(
+    k: int,
+    features_df: pd.DataFrame,
+    s1_fold_arr: np.ndarray,
+    cv_folds_df: pd.DataFrame,
+    gt_dict: Mapping[str, set[str]],
+    best_cfg: HyperparamConfig,
+    base_tau: float,
+    checkpoint_mgr: CheckpointManager | None = None,
+    sample_s1: int | None = None,
+    threads_per_worker: int | None = None,
+) -> tuple[FoldMetric, dict[str, set[str]], pd.DataFrame]:
+    """Execute Two-Pass training, meta-feature engineering, and evaluation for a single fold."""
+    val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k]["entity_id"].astype(str))
+    val_gt = {k_id: v for k_id, v in gt_dict.items() if k_id in val_s1_set}
+
+    m_key = f"fold_{k}_metrics_sample_{sample_s1}" if sample_s1 else f"fold_{k}_metrics"
+    sp_key = (
+        f"fold_{k}_scored_pairs_sample_{sample_s1}" if sample_s1 else f"fold_{k}_scored_pairs"
+    )
+
+    predictor = SingletonGatedPredictor()
+
+    # Check for completed fold checkpoint
+    if (
+        checkpoint_mgr is not None
+        and checkpoint_mgr.has_checkpoint(m_key, ext="json")
+        and checkpoint_mgr.has_checkpoint(sp_key)
+    ):
+        metric_data = checkpoint_mgr.load_json(m_key)
+        val_pairs_scored = checkpoint_mgr.load_dataframe(sp_key)
+        if metric_data is not None and val_pairs_scored is not None:
+            cached_metric = FoldMetric(**metric_data)
+            cached_preds = predictor.filter_predictions(
+                val_pairs_scored, list(val_s1_set), threshold=cached_metric.optimal_tau
+            )
+            return cached_metric, cached_preds, val_pairs_scored[["s1_id", "cand_id", "prob"]]
+
+    all_features = list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS)
+    val_mask = s1_fold_arr == k
+    train_mask = (s1_fold_arr != k) & (s1_fold_arr != -1)
+
+    train_pairs = features_df[train_mask].copy()
+    val_pairs = features_df[val_mask].copy()
+
+    # Pass 1: Raw 49 Features
+    matcher_p1 = LightGBMMatcher(
+        learning_rate=best_cfg.learning_rate,
+        num_leaves=best_cfg.num_leaves,
+        max_depth=best_cfg.max_depth,
+        n_estimators=best_cfg.n_estimators,
+        feature_columns=FEATURE_COLUMNS,
+        seed=42 + k,
+        num_threads=threads_per_worker,
+    )
+    matcher_p1.train(train_pairs, val_df=val_pairs)
+
+    train_pairs["prob"] = matcher_p1.predict_proba(train_pairs)
+    val_pairs["prob"] = matcher_p1.predict_proba(val_pairs)
+
+    # Compute Entity Meta-Features (Track A)
+    compute_entity_meta_features(train_pairs, prob_col="prob")
+    compute_entity_meta_features(val_pairs, prob_col="prob")
+
+    # Pass 2: Combined 54 Features (49 + 5 Meta)
+    matcher_p2 = LightGBMMatcher(
+        learning_rate=best_cfg.learning_rate,
+        num_leaves=best_cfg.num_leaves,
+        max_depth=best_cfg.max_depth,
+        n_estimators=best_cfg.n_estimators,
+        feature_columns=all_features,
+        seed=1042 + k,
+        num_threads=threads_per_worker,
+    )
+    matcher_p2.train(train_pairs, val_df=val_pairs)
+
+    # Optimize threshold tau on Pass 2 probabilities
+    search_range = [
+        base_tau - 0.08,
+        base_tau - 0.04,
+        base_tau,
+        base_tau + 0.04,
+        base_tau + 0.08,
+    ]
+    search_range = [t for t in search_range if 0.45 <= t <= 0.95]
+    best_tau_k, _ = matcher_p2.optimize_threshold(val_pairs, val_gt, search_range=search_range)
+
+    # Out-of-fold inference with Pass 2 probabilities
+    val_pairs["prob"] = matcher_p2.predict_proba(val_pairs)
+    fold_preds = predictor.filter_predictions(val_pairs, list(val_s1_set), threshold=best_tau_k)
+
+    report = evaluate_resolution_predictions(val_gt, fold_preds)
+    prec = (
+        report.total_correct_pairs / report.total_predicted_pairs
+        if report.total_predicted_pairs > 0
+        else 0.0
+    )
+    rec = (
+        report.total_correct_pairs / report.total_true_pairs
+        if report.total_true_pairs > 0
+        else 0.0
+    )
+    fold_metric = FoldMetric(
+        fold=int(k),
+        train_entities=len(cv_folds_df[cv_folds_df["fold"] != k]),
+        val_entities=len(val_s1_set),
+        train_pairs=len(train_pairs),
+        val_pairs=len(val_pairs),
+        optimal_tau=best_tau_k,
+        macro_f05=report.macro_f05,
+        singleton_acc=report.singleton_score,
+        non_singleton_f05=report.non_singleton_f05,
+        precision=prec,
+        recall=rec,
+    )
+
+    if checkpoint_mgr is not None:
+        checkpoint_mgr.save_dataframe(sp_key, val_pairs[["s1_id", "cand_id", "prob"]])
+        checkpoint_mgr.save_json(m_key, asdict(fold_metric))
+        checkpoint_mgr.record_stage_completed(
+            m_key,
+            {"optimal_tau": best_tau_k, "macro_f05": report.macro_f05},
+        )
+
+    return fold_metric, fold_preds, val_pairs[["s1_id", "cand_id", "prob"]]
+
+
 def run_cross_validation(
     features_df: pd.DataFrame,
     cv_folds_df: pd.DataFrame,
@@ -391,6 +518,7 @@ def run_cross_validation(
     base_tau: float,
     checkpoint_mgr: CheckpointManager | None = None,
     sample_s1: int | None = None,
+    n_jobs: int = 1,
 ) -> tuple[list[FoldMetric], dict[str, set[str]], pd.DataFrame]:
     """Execute Two-Pass 5-fold CV, return fold metrics and complete OOF predictions."""
     print("================================================================================")
@@ -403,7 +531,6 @@ def run_cross_validation(
     )
     s1_fold_arr = np.array([fold_map.get(s1, -1) for s1 in features_df["s1_id"].astype(str)])
 
-    predictor = SingletonGatedPredictor()
     fold_results: list[FoldMetric] = []
     oof_predictions: dict[str, set[str]] = {
         s1: set() for s1 in cv_folds_df["entity_id"].astype(str)
@@ -419,148 +546,83 @@ def run_cross_validation(
     print(header)
     print("-" * len(header))
 
-    all_features = list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS)
+    if n_jobs > 1 and len(folds) > 1:
+        import concurrent.futures
+        import multiprocessing as mp
 
-    for k in tqdm(folds, desc="  ⚡ 5-Fold Cross Validation", unit="fold", leave=False):
-        val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k]["entity_id"].astype(str))
-        val_gt = {k_id: v for k_id, v in gt_dict.items() if k_id in val_s1_set}
-
-        m_key = f"fold_{k}_metrics_sample_{sample_s1}" if sample_s1 else f"fold_{k}_metrics"
-        sp_key = (
-            f"fold_{k}_scored_pairs_sample_{sample_s1}" if sample_s1 else f"fold_{k}_scored_pairs"
+        ctx = mp.get_context("fork")
+        workers = min(n_jobs, len(folds))
+        threads_per_worker = max(1, 40 // workers)
+        print(
+            f"  ⚡ Launching {workers} concurrent fold worker processes "
+            f"(threads/worker={threads_per_worker})..."
         )
-
-        # Check for completed fold checkpoint
-        if (
-            checkpoint_mgr is not None
-            and checkpoint_mgr.has_checkpoint(m_key, ext="json")
-            and checkpoint_mgr.has_checkpoint(sp_key)
-        ):
-            metric_data = checkpoint_mgr.load_json(m_key)
-            val_pairs_scored = checkpoint_mgr.load_dataframe(sp_key)
-            if metric_data is not None and val_pairs_scored is not None:
-                cached_metric = FoldMetric(**metric_data)
-                fold_results.append(cached_metric)
-                oof_scored_parts.append(val_pairs_scored[["s1_id", "cand_id", "prob"]])
-                cached_preds = predictor.filter_predictions(
-                    val_pairs_scored, list(val_s1_set), threshold=cached_metric.optimal_tau
+        results_map: dict[int, tuple[FoldMetric, dict[str, set[str]], pd.DataFrame]] = {}
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers, mp_context=ctx
+        ) as executor:
+            futures = {
+                executor.submit(
+                    evaluate_single_fold,
+                    k,
+                    features_df,
+                    s1_fold_arr,
+                    cv_folds_df,
+                    gt_dict,
+                    best_cfg,
+                    base_tau,
+                    checkpoint_mgr,
+                    sample_s1,
+                    threads_per_worker,
+                ): k
+                for k in folds
+            }
+            for future in concurrent.futures.as_completed(futures):
+                k = futures[future]
+                res = future.result()
+                results_map[k] = res
+                f_m = res[0]
+                print(
+                    f"  ✓ [Parallel Worker] Fold {k} completed: "
+                    f"Macro F0.5={f_m.macro_f05:.4f}, tau={f_m.optimal_tau:.2f}, "
+                    f"Sing. Acc={f_m.singleton_acc*100:.2f}%"
                 )
-                for s1, p_set in cached_preds.items():
-                    oof_predictions[s1] = p_set
 
-                m_f05 = cached_metric.macro_f05
-                s_acc = cached_metric.singleton_acc * 100
-                ns_f05 = cached_metric.non_singleton_f05
-                prec = cached_metric.precision * 100
-                rec = cached_metric.recall * 100
-                row_str = (
-                    f"{k:<5} | {cached_metric.train_pairs:<10,} | {cached_metric.val_pairs:<8,} | "
-                    f"{cached_metric.optimal_tau:<5.2f} | {m_f05:<10.4f} | "
-                    f"{s_acc:<9.2f}% | {ns_f05:<12.4f} | "
-                    f"{prec:<7.2f}% | {rec:<6.2f}% (cached)"
-                )
-                print(row_str)
-                continue
-
-        val_mask = s1_fold_arr == k
-        train_mask = (s1_fold_arr != k) & (s1_fold_arr != -1)
-
-        train_pairs = features_df[train_mask].copy()
-        val_pairs = features_df[val_mask].copy()
-
-        # Pass 1: Raw 49 Features
-        matcher_p1 = LightGBMMatcher(
-            learning_rate=best_cfg.learning_rate,
-            num_leaves=best_cfg.num_leaves,
-            max_depth=best_cfg.max_depth,
-            n_estimators=best_cfg.n_estimators,
-            feature_columns=FEATURE_COLUMNS,
-            seed=42 + k,
-        )
-        matcher_p1.train(train_pairs, val_pairs)
-
-        train_pairs["prob"] = matcher_p1.predict_proba(train_pairs)
-        val_pairs["prob"] = matcher_p1.predict_proba(val_pairs)
-
-        # Compute Entity Meta-Features (Track A)
-        compute_entity_meta_features(train_pairs, prob_col="prob")
-        compute_entity_meta_features(val_pairs, prob_col="prob")
-
-        # Pass 2: Combined 54 Features (49 + 5 Meta)
-        matcher_p2 = LightGBMMatcher(
-            learning_rate=best_cfg.learning_rate,
-            num_leaves=best_cfg.num_leaves,
-            max_depth=best_cfg.max_depth,
-            n_estimators=best_cfg.n_estimators,
-            feature_columns=all_features,
-            seed=1042 + k,
-        )
-        matcher_p2.train(train_pairs, val_pairs)
-
-        # Optimize threshold tau on Pass 2 probabilities
-        search_range = [
-            base_tau - 0.12,
-            base_tau - 0.08,
-            base_tau - 0.04,
-            base_tau,
-            base_tau + 0.04,
-            base_tau + 0.08,
-            base_tau + 0.12,
-        ]
-        search_range = [t for t in search_range if 0.45 <= t <= 0.95]
-        best_tau_k, _ = matcher_p2.optimize_threshold(val_pairs, val_gt, search_range=search_range)
-
-        # Out-of-fold inference with Pass 2 probabilities
-        val_pairs["prob"] = matcher_p2.predict_proba(val_pairs)
-        fold_preds = predictor.filter_predictions(val_pairs, list(val_s1_set), threshold=best_tau_k)
-
-        # Merge fold predictions into OOF set
-        for s1, p_set in fold_preds.items():
-            oof_predictions[s1] = p_set
-
-        oof_scored_parts.append(val_pairs[["s1_id", "cand_id", "prob"]])
-
-        report = evaluate_resolution_predictions(val_gt, fold_preds)
-        prec = (
-            report.total_correct_pairs / report.total_predicted_pairs
-            if report.total_predicted_pairs > 0
-            else 0.0
-        )
-        rec = (
-            report.total_correct_pairs / report.total_true_pairs
-            if report.total_true_pairs > 0
-            else 0.0
-        )
-        fold_metric = FoldMetric(
-            fold=int(k),
-            train_entities=len(cv_folds_df[cv_folds_df["fold"] != k]),
-            val_entities=len(val_s1_set),
-            train_pairs=len(train_pairs),
-            val_pairs=len(val_pairs),
-            optimal_tau=best_tau_k,
-            macro_f05=report.macro_f05,
-            singleton_acc=report.singleton_score,
-            non_singleton_f05=report.non_singleton_f05,
-            precision=prec,
-            recall=rec,
-        )
-        fold_results.append(fold_metric)
-
-        if checkpoint_mgr is not None:
-            checkpoint_mgr.save_dataframe(sp_key, val_pairs[["s1_id", "cand_id", "prob"]])
-            checkpoint_mgr.save_json(m_key, asdict(fold_metric))
-            checkpoint_mgr.record_stage_completed(
-                m_key,
-                {"optimal_tau": best_tau_k, "macro_f05": report.macro_f05},
+        for k in folds:
+            f_metric, f_preds, f_scored = results_map[k]
+            fold_results.append(f_metric)
+            oof_predictions.update(f_preds)
+            oof_scored_parts.append(f_scored)
+            row_str = (
+                f"{k:<5} | {f_metric.train_pairs:<10,} | {f_metric.val_pairs:<8,} | "
+                f"{f_metric.optimal_tau:<5.2f} | {f_metric.macro_f05:<10.4f} | "
+                f"{f_metric.singleton_acc * 100:<9.2f}% | {f_metric.non_singleton_f05:<12.4f} | "
+                f"{f_metric.precision * 100:<7.2f}% | {f_metric.recall * 100:<6.2f}%"
             )
-
-        row_str = (
-            f"{k:<5} | {len(train_pairs):<10,} | {len(val_pairs):<8,} | {best_tau_k:<5.2f} | "
-            f"{report.macro_f05:<10.4f} | {report.singleton_score * 100:<9.2f}% | "
-            f"{report.non_singleton_f05:<12.4f} | {prec * 100:<7.2f}% | "
-            f"{rec * 100:<6.2f}%"
-        )
-        print(row_str)
+            print(row_str)
+    else:
+        for k in tqdm(folds, desc="  ⚡ 5-Fold Cross Validation", unit="fold", leave=False):
+            f_metric, f_preds, f_scored = evaluate_single_fold(
+                k=k,
+                features_df=features_df,
+                s1_fold_arr=s1_fold_arr,
+                cv_folds_df=cv_folds_df,
+                gt_dict=gt_dict,
+                best_cfg=best_cfg,
+                base_tau=base_tau,
+                checkpoint_mgr=checkpoint_mgr,
+                sample_s1=sample_s1,
+            )
+            fold_results.append(f_metric)
+            oof_predictions.update(f_preds)
+            oof_scored_parts.append(f_scored)
+            row_str = (
+                f"{k:<5} | {f_metric.train_pairs:<10,} | {f_metric.val_pairs:<8,} | "
+                f"{f_metric.optimal_tau:<5.2f} | {f_metric.macro_f05:<10.4f} | "
+                f"{f_metric.singleton_acc * 100:<9.2f}% | {f_metric.non_singleton_f05:<12.4f} | "
+                f"{f_metric.precision * 100:<7.2f}% | {f_metric.recall * 100:<6.2f}%"
+            )
+            print(row_str)
 
     print("-" * len(header))
     mean_f05 = np.mean([r.macro_f05 for r in fold_results])
@@ -585,6 +647,7 @@ def run_benchmark(
     reset_checkpoints: bool = False,
     skip_sweep: bool = False,
     sample_s1: int | None = None,
+    n_jobs: int = 1,
 ) -> None:
     """Execute complete benchmark workflow with two-pass meta-resolution."""
     data_path = Path(data_dir)
@@ -613,7 +676,10 @@ def run_benchmark(
         s2_df = load_business_records_df(data_path / "train_source2.tsv")
         s3_df = load_business_records_df(data_path / "train_source3.tsv")
         gt_dict = load_ground_truth_dict(data_path / "train_ground_truth.tsv")
-        cv_folds_df = pd.read_csv(data_path / "cv_folds_source1.tsv", sep="\t")
+        if (data_path / "cv_folds_source1.parquet").is_file():
+            cv_folds_df = pd.read_parquet(data_path / "cv_folds_source1.parquet")
+        else:
+            cv_folds_df = pd.read_csv(data_path / "cv_folds_source1.tsv", sep="\t")
 
         if sample_s1 and sample_s1 < len(s1_df):
             print(f"  ⚡ Running test sample with {sample_s1:,} S1 entities...")
@@ -746,7 +812,7 @@ def run_benchmark(
                 max_depth=8,
                 n_estimators=150,
             )
-            base_tau = 0.74
+            base_tau = 0.86
 
     exec_logger.check_memory_threshold()
 
@@ -760,6 +826,7 @@ def run_benchmark(
             base_tau=base_tau,
             checkpoint_mgr=checkpoint_mgr,
             sample_s1=sample_s1,
+            n_jobs=n_jobs,
         )
 
         # Save final OOF matching results
@@ -844,6 +911,12 @@ def main() -> None:
     parser.add_argument(
         "--sample-s1", type=int, default=None, help="Optional sample limit for quick dry run"
     )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Number of concurrent processes for 5-fold cross-validation",
+    )
     args = parser.parse_args()
 
     rep_dir = Path(args.reports_dir)
@@ -861,6 +934,7 @@ def main() -> None:
         reset_checkpoints=args.reset_checkpoints,
         skip_sweep=args.skip_sweep,
         sample_s1=args.sample_s1,
+        n_jobs=args.n_jobs,
     )
 
 
