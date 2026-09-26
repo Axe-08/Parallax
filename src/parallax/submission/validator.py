@@ -132,6 +132,28 @@ class SubmissionValidator:
         return report
 
 
+def validate_official_er_submission(
+    matching_tsv_path: Path | str,
+    test_dir: Path | str,
+    candidate_tsv_path: Path | str | None = None,
+    check_ids: bool = True,
+) -> tuple[bool, list[str], list[str]]:
+    """
+    Validate matching_results.tsv against official competition invariants.
+    Returns (is_valid, errors, warnings).
+    """
+    from utils.validate_submission import validate
+
+    cand_str = str(candidate_tsv_path) if candidate_tsv_path else None
+    errors, warnings = validate(
+        matching_path=str(matching_tsv_path),
+        candidate_path=cand_str,
+        test_dir=str(test_dir),
+        check_ids=check_ids,
+    )
+    return len(errors) == 0, errors, warnings
+
+
 def main() -> None:
     """CLI to validate a submission file."""
     parser = argparse.ArgumentParser(description="Parallax Submission Integrity Validator")

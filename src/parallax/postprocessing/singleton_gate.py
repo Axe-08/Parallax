@@ -30,8 +30,8 @@ class SingletonGatedPredictor:
         threshold: float | None = None,
     ) -> dict[str, set[str]]:
         """
-        Produce final match sets for all Source 1 entities.
-        If max probability for an S1 entity is below threshold, keeps empty set.
+        Produce final match sets for all Source 1 entities with calibrated threshold gating.
+        Ensures all Source 1 entities are present in the output mapping.
         """
         tau = threshold if threshold is not None else self.decision_threshold
         predictions: dict[str, set[str]] = {s1_id: set() for s1_id in all_s1_ids}
@@ -39,11 +39,11 @@ class SingletonGatedPredictor:
         if len(scored_pairs_df) == 0:
             return predictions
 
-        # Filter by threshold
-        filtered = scored_pairs_df[scored_pairs_df["prob"] >= tau]
+        # Filter by calibrated probability threshold
+        base_matches = scored_pairs_df[scored_pairs_df["prob"] >= tau]
 
         for s1, cand in zip(
-            filtered["s1_id"].to_numpy(), filtered["cand_id"].to_numpy(), strict=False
+            base_matches["s1_id"].to_numpy(), base_matches["cand_id"].to_numpy(), strict=False
         ):
             s1_str = str(s1)
             if s1_str in predictions:

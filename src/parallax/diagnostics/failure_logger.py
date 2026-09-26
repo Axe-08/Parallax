@@ -9,7 +9,7 @@ Automated root-cause error triaging:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 import pandas as pd
@@ -28,7 +28,7 @@ class FailureDiagnosticsLogger:
     def analyze_and_log_failures(
         self,
         ground_truth: Mapping[str, set[str]],
-        candidates: Mapping[str, set[str]],
+        candidates: Mapping[str, Collection[str]],
         predictions: Mapping[str, set[str]],
         scored_pairs_df: pd.DataFrame,
         s1_df: pd.DataFrame,

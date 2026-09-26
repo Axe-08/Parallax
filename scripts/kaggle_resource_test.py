@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import argparse
 import gc
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -232,7 +232,9 @@ def main() -> None:
     t_load = time.perf_counter() - t0
     rss, peak, vms = get_memory_info()
     log(f"   ✓ Loaded S1: {len(s1_df):,} | Target Pool (S2+S3): {len(target_df):,}")
-    log(f"   ✓ Load Time: {t_load:.2f}s | Current RAM: {rss:.1f} MB ({rss/1024:.2f} GB) | Peak: {peak:.1f} MB\n")
+    log(
+        f"   ✓ Load Time: {t_load:.2f}s | Current RAM: {rss:.1f} MB ({rss / 1024:.2f} GB) | Peak: {peak:.1f} MB\n"
+    )
 
     # --- Step 2: Widening / Preprocessing ---
     t0 = time.perf_counter()
@@ -245,7 +247,7 @@ def main() -> None:
     t_widen = time.perf_counter() - t0
     rss, peak, vms = get_memory_info()
     log(f"   ✓ Preprocessing completed in {t_widen:.2f}s")
-    log(f"   ✓ Current RAM: {rss:.1f} MB ({rss/1024:.2f} GB) | Peak: {peak:.1f} MB\n")
+    log(f"   ✓ Current RAM: {rss:.1f} MB ({rss / 1024:.2f} GB) | Peak: {peak:.1f} MB\n")
 
     # --- Step 3: Country-Partitioned Dual-Channel Blocking ---
     log("==> 3. Running Dual-Channel TF-IDF Blocker...")
@@ -259,7 +261,9 @@ def main() -> None:
     addr_min_sim = 0.20
     batch_size = args.batch_size
 
-    def _build_texts(df: pd.DataFrame, primary_col: str, fallback_col: str, translit_col: str) -> list[str]:
+    def _build_texts(
+        df: pd.DataFrame, primary_col: str, fallback_col: str, translit_col: str
+    ) -> list[str]:
         if primary_col in df:
             p_s = df[primary_col].fillna("").astype(str).str.strip()
             if fallback_col in df:
@@ -305,16 +309,20 @@ def main() -> None:
 
         n_vocab_name, n_tgt_name = tgt_name_mat.shape
         nnz_name = tgt_name_mat.nnz
-        mat_size_mb_name = (tgt_name_mat.data.nbytes + tgt_name_mat.indices.nbytes + tgt_name_mat.indptr.nbytes) / (1024 * 1024)
+        mat_size_mb_name = (
+            tgt_name_mat.data.nbytes + tgt_name_mat.indices.nbytes + tgt_name_mat.indptr.nbytes
+        ) / (1024 * 1024)
 
-        sparse_matrix_stats.append({
-            "country": country,
-            "channel": "Name TF-IDF",
-            "shape": f"({n_vocab_name:,}, {n_tgt_name:,})",
-            "nnz": f"{nnz_name:,}",
-            "sparsity_pct": f"{(1.0 - nnz_name / (n_vocab_name * n_tgt_name)) * 100:.4f}%",
-            "matrix_size_mb": f"{mat_size_mb_name:.1f} MB",
-        })
+        sparse_matrix_stats.append(
+            {
+                "country": country,
+                "channel": "Name TF-IDF",
+                "shape": f"({n_vocab_name:,}, {n_tgt_name:,})",
+                "nnz": f"{nnz_name:,}",
+                "sparsity_pct": f"{(1.0 - nnz_name / (n_vocab_name * n_tgt_name)) * 100:.4f}%",
+                "matrix_size_mb": f"{mat_size_mb_name:.1f} MB",
+            }
+        )
 
         for start_idx in range(0, len(s1_c), batch_size):
             end_idx = min(start_idx + batch_size, len(s1_c))
@@ -346,14 +354,18 @@ def main() -> None:
         t_ch_name = time.perf_counter() - t_ch0
         rss, peak, vms = get_memory_info()
         cands_so_far = sum(len(c) for c in candidate_pairs.values())
-        log(f"     ✓ Channel A [Name]: time={t_ch_name:.2f}s | matrix={mat_size_mb_name:.1f}MB | RAM={rss:.1f}MB | pairs={cands_so_far:,}")
-        blocking_channel_stats.append({
-            "stage": f"[{country}] Name TF-IDF",
-            "time_sec": round(t_ch_name, 2),
-            "rss_mb": round(rss, 1),
-            "peak_rss_mb": round(peak, 1),
-            "cumulative_candidates": cands_so_far,
-        })
+        log(
+            f"     ✓ Channel A [Name]: time={t_ch_name:.2f}s | matrix={mat_size_mb_name:.1f}MB | RAM={rss:.1f}MB | pairs={cands_so_far:,}"
+        )
+        blocking_channel_stats.append(
+            {
+                "stage": f"[{country}] Name TF-IDF",
+                "time_sec": round(t_ch_name, 2),
+                "rss_mb": round(rss, 1),
+                "peak_rss_mb": round(peak, 1),
+                "cumulative_candidates": cands_so_far,
+            }
+        )
 
         # Clean intermediate name matrix
         del vec_name, tgt_name_mat
@@ -363,21 +375,31 @@ def main() -> None:
         t_ch0 = time.perf_counter()
         min_df_addr = 2 if len(tgt_c) > 500 else 1
         max_df_addr = 0.40 if len(tgt_c) > 500 else 1.0
-        vec_addr = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=min_df_addr, max_df=max_df_addr, sublinear_tf=True)
+        vec_addr = TfidfVectorizer(
+            analyzer="char",
+            ngram_range=(3, 3),
+            min_df=min_df_addr,
+            max_df=max_df_addr,
+            sublinear_tf=True,
+        )
         tgt_addr_mat = vec_addr.fit_transform(tgt_addrs).T
 
         n_vocab_addr, n_tgt_addr = tgt_addr_mat.shape
         nnz_addr = tgt_addr_mat.nnz
-        mat_size_mb_addr = (tgt_addr_mat.data.nbytes + tgt_addr_mat.indices.nbytes + tgt_addr_mat.indptr.nbytes) / (1024 * 1024)
+        mat_size_mb_addr = (
+            tgt_addr_mat.data.nbytes + tgt_addr_mat.indices.nbytes + tgt_addr_mat.indptr.nbytes
+        ) / (1024 * 1024)
 
-        sparse_matrix_stats.append({
-            "country": country,
-            "channel": "Addr TF-IDF",
-            "shape": f"({n_vocab_addr:,}, {n_tgt_addr:,})",
-            "nnz": f"{nnz_addr:,}",
-            "sparsity_pct": f"{(1.0 - nnz_addr / (n_vocab_addr * n_tgt_addr)) * 100:.4f}%",
-            "matrix_size_mb": f"{mat_size_mb_addr:.1f} MB",
-        })
+        sparse_matrix_stats.append(
+            {
+                "country": country,
+                "channel": "Addr TF-IDF",
+                "shape": f"({n_vocab_addr:,}, {n_tgt_addr:,})",
+                "nnz": f"{nnz_addr:,}",
+                "sparsity_pct": f"{(1.0 - nnz_addr / (n_vocab_addr * n_tgt_addr)) * 100:.4f}%",
+                "matrix_size_mb": f"{mat_size_mb_addr:.1f} MB",
+            }
+        )
 
         for start_idx in range(0, len(s1_c), batch_size):
             end_idx = min(start_idx + batch_size, len(s1_c))
@@ -411,14 +433,18 @@ def main() -> None:
         t_ch_addr = time.perf_counter() - t_ch0
         rss, peak, vms = get_memory_info()
         cands_so_far = sum(len(c) for c in candidate_pairs.values())
-        log(f"     ✓ Channel B [Addr]: time={t_ch_addr:.2f}s | matrix={mat_size_mb_addr:.1f}MB | RAM={rss:.1f}MB | pairs={cands_so_far:,}")
-        blocking_channel_stats.append({
-            "stage": f"[{country}] Addr TF-IDF",
-            "time_sec": round(t_ch_addr, 2),
-            "rss_mb": round(rss, 1),
-            "peak_rss_mb": round(peak, 1),
-            "cumulative_candidates": cands_so_far,
-        })
+        log(
+            f"     ✓ Channel B [Addr]: time={t_ch_addr:.2f}s | matrix={mat_size_mb_addr:.1f}MB | RAM={rss:.1f}MB | pairs={cands_so_far:,}"
+        )
+        blocking_channel_stats.append(
+            {
+                "stage": f"[{country}] Addr TF-IDF",
+                "time_sec": round(t_ch_addr, 2),
+                "rss_mb": round(rss, 1),
+                "peak_rss_mb": round(peak, 1),
+                "cumulative_candidates": cands_so_far,
+            }
+        )
 
         # Clean intermediate address matrix
         del vec_addr, tgt_addr_mat
@@ -428,7 +454,11 @@ def main() -> None:
         t_ch0 = time.perf_counter()
         if "numbers" in s1_c and "numbers" in tgt_c:
             tgt_ids = tgt_c["entity_id"].astype(str).tolist()
-            tgt_names_ser = tgt_c["soft_name"].fillna("").astype(str) if "soft_name" in tgt_c else tgt_c["business_name"].fillna("").astype(str)
+            tgt_names_ser = (
+                tgt_c["soft_name"].fillna("").astype(str)
+                if "soft_name" in tgt_c
+                else tgt_c["business_name"].fillna("").astype(str)
+            )
             tgt_prefixes = dict(zip(tgt_ids, tgt_names_ser.str[:2].tolist(), strict=False))
 
             num_to_tgt = {}
@@ -439,10 +469,16 @@ def main() -> None:
                         num_to_tgt.setdefault(num_str, []).append(eid)
 
             s1_ids = s1_c["entity_id"].astype(str).tolist()
-            s1_names_ser = s1_c["soft_name"].fillna("").astype(str) if "soft_name" in s1_c else s1_c["business_name"].fillna("").astype(str)
+            s1_names_ser = (
+                s1_c["soft_name"].fillna("").astype(str)
+                if "soft_name" in s1_c
+                else s1_c["business_name"].fillna("").astype(str)
+            )
             s1_prefixes = s1_names_ser.str[:2].tolist()
 
-            for s1_id, s1_pfx, num_set in zip(s1_ids, s1_prefixes, s1_c["numbers"].tolist(), strict=False):
+            for s1_id, s1_pfx, num_set in zip(
+                s1_ids, s1_prefixes, s1_c["numbers"].tolist(), strict=False
+            ):
                 if not s1_pfx:
                     continue
                 for num in num_set:
@@ -458,14 +494,18 @@ def main() -> None:
         t_ch_bldg = time.perf_counter() - t_ch0
         rss, peak, vms = get_memory_info()
         cands_so_far = sum(len(c) for c in candidate_pairs.values())
-        log(f"     ✓ Channel C [BldgNum]: time={t_ch_bldg:.2f}s | RAM={rss:.1f}MB | pairs={cands_so_far:,}\n")
-        blocking_channel_stats.append({
-            "stage": f"[{country}] BldgNum",
-            "time_sec": round(t_ch_bldg, 2),
-            "rss_mb": round(rss, 1),
-            "peak_rss_mb": round(peak, 1),
-            "cumulative_candidates": cands_so_far,
-        })
+        log(
+            f"     ✓ Channel C [BldgNum]: time={t_ch_bldg:.2f}s | RAM={rss:.1f}MB | pairs={cands_so_far:,}\n"
+        )
+        blocking_channel_stats.append(
+            {
+                "stage": f"[{country}] BldgNum",
+                "time_sec": round(t_ch_bldg, 2),
+                "rss_mb": round(rss, 1),
+                "peak_rss_mb": round(peak, 1),
+                "cumulative_candidates": cands_so_far,
+            }
+        )
 
     # Save candidates TSV
     cand_file = out_path / "candidate_pairs.tsv"
@@ -475,20 +515,32 @@ def main() -> None:
 
     if gt_dict:
         blocking_report = evaluate_blocking_candidates(gt_dict, candidate_pairs, len(target_wide))
-        log(f"   📊 Blocking Recall (Pair Completeness): {blocking_report.pair_completeness * 100:.2f}%")
-        log(f"   📊 Reduction Ratio:                    {blocking_report.reduction_ratio * 100:.4f}%")
-        log(f"   📊 Avg Candidates per S1:              {blocking_report.avg_candidates_per_s1:.1f}\n")
+        log(
+            f"   📊 Blocking Recall (Pair Completeness): {blocking_report.pair_completeness * 100:.2f}%"
+        )
+        log(
+            f"   📊 Reduction Ratio:                    {blocking_report.reduction_ratio * 100:.4f}%"
+        )
+        log(
+            f"   📊 Avg Candidates per S1:              {blocking_report.avg_candidates_per_s1:.1f}\n"
+        )
 
     # --- Step 4: Feature Extraction (28 Features) ---
     t0 = time.perf_counter()
     log("==> 4. Extracting 28 RapidFuzz & Canonical Address Features...")
     extractor = PairwiseFeatureExtractor()
-    pairs_df = extractor.extract_features_df(candidate_pairs, s1_wide, target_wide, ground_truth=gt_dict)
+    pairs_df = extractor.extract_features_df(
+        candidate_pairs, s1_wide, target_wide, ground_truth=gt_dict
+    )
     t_feat = time.perf_counter() - t0
     rss, peak, vms = get_memory_info()
     pairs_mem_mb = pairs_df.memory_usage(deep=True).sum() / (1024 * 1024)
-    log(f"   ✓ Extracted {len(pairs_df):,} feature rows in {t_feat:.2f}s ({len(pairs_df) / max(t_feat, 0.001):,.0f} pairs/sec)")
-    log(f"   ✓ pairs_df Memory: {pairs_mem_mb:.1f} MB | Current RAM: {rss:.1f} MB ({rss/1024:.2f} GB) | Peak: {peak:.1f} MB\n")
+    log(
+        f"   ✓ Extracted {len(pairs_df):,} feature rows in {t_feat:.2f}s ({len(pairs_df) / max(t_feat, 0.001):,.0f} pairs/sec)"
+    )
+    log(
+        f"   ✓ pairs_df Memory: {pairs_mem_mb:.1f} MB | Current RAM: {rss:.1f} MB ({rss / 1024:.2f} GB) | Peak: {peak:.1f} MB\n"
+    )
 
     # --- Step 5: LightGBM Training & Threshold Calibration ---
     t0 = time.perf_counter()
@@ -513,7 +565,9 @@ def main() -> None:
     # Generate predictions on full S1
     predictor = SingletonGatedPredictor(decision_threshold=best_tau)
     pairs_df["prob"] = matcher.predict_proba(pairs_df)
-    final_preds = predictor.filter_predictions(pairs_df, list(s1_wide["entity_id"]), threshold=best_tau)
+    final_preds = predictor.filter_predictions(
+        pairs_df, list(s1_wide["entity_id"]), threshold=best_tau
+    )
 
     # Save matching results TSV
     match_file = out_path / "matching_results.tsv"

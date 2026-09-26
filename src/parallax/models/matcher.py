@@ -29,6 +29,8 @@ class LightGBMMatcher:
         max_depth: int = 6,
         n_estimators: int = 150,
         decision_threshold: float = 0.75,
+        scale_pos_weight: float = 3.0,
+        feature_columns: Sequence[str] | None = None,
         seed: int = 42,
     ) -> None:
         self.learning_rate = learning_rate
@@ -36,6 +38,10 @@ class LightGBMMatcher:
         self.max_depth = max_depth
         self.n_estimators = n_estimators
         self.decision_threshold = decision_threshold
+        self.scale_pos_weight = scale_pos_weight
+        self.feature_columns = (
+            list(feature_columns) if feature_columns is not None else list(FEATURE_COLUMNS)
+        )
         self.seed = seed
         self.model: lgb.Booster | None = None
 
@@ -45,7 +51,7 @@ class LightGBMMatcher:
         val_df: pd.DataFrame | None = None,
     ) -> None:
         """Train LightGBM binary classifier on candidate pair features."""
-        x_train = train_df[FEATURE_COLUMNS]
+        x_train = train_df[self.feature_columns]
         y_train = train_df["target"].astype(int)
 
         train_data = lgb.Dataset(x_train, label=y_train)
@@ -58,12 +64,18 @@ class LightGBMMatcher:
             "max_depth": self.max_depth,
             "verbose": -1,
             "seed": self.seed,
-            "scale_pos_weight": 1.0,  # Standard or calibrated
+            "scale_pos_weight": self.scale_pos_weight,
+            "lambda_l1": 0.1,
+            "lambda_l2": 0.1,
+            "min_child_samples": 20,
+            "colsample_bytree": 0.8,
+            "subsample": 0.9,
+            "subsample_freq": 1,
         }
 
         valid_sets = [train_data]
         if val_df is not None:
-            x_val = val_df[FEATURE_COLUMNS]
+            x_val = val_df[self.feature_columns]
             y_val = val_df["target"].astype(int)
             val_data = lgb.Dataset(x_val, label=y_val, reference=train_data)
             valid_sets.append(val_data)
@@ -79,7 +91,7 @@ class LightGBMMatcher:
         """Predict match probability for candidate pairs."""
         if self.model is None:
             raise RuntimeError("Model has not been trained yet.")
-        x = df[FEATURE_COLUMNS]
+        x = df[self.feature_columns]
         preds = self.model.predict(x)
         return np.asarray(preds, dtype=np.float64)
 

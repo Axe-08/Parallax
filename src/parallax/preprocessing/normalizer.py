@@ -109,6 +109,33 @@ _ABBREVIATION_MAP: dict[str, str] = {
     "wv": "west virginia",
     "wi": "wisconsin",
     "wy": "wyoming",
+    # Indian States and Union Territories
+    "mh": "maharashtra",
+    "dl": "delhi",
+    "ka": "karnataka",
+    "gj": "gujarat",
+    "wb": "west bengal",
+    "up": "uttar pradesh",
+    "mp": "madhya pradesh",
+    "ap": "andhra pradesh",
+    "ts": "telangana",
+    "kl": "kerala",
+    "rj": "rajasthan",
+    "pb": "punjab",
+    "hr": "haryana",
+    "br": "bihar",
+    "od": "odisha",
+    "jh": "jharkhand",
+    "as": "assam",
+    "ch": "chandigarh",
+    "uk": "uttarakhand",
+    # Transliterated Indic state tokens
+    "mhaaraashtr": "maharashtra",
+    "maharashtr": "maharashtra",
+    "krnaatk": "karnataka",
+    "gujraat": "gujarat",
+    "tmilnaadu": "tamil nadu",
+    "dillii": "delhi",
 }
 
 _PREFIX_MARKER = re.compile(
@@ -219,7 +246,8 @@ def canonicalize_address(address: str | None) -> str:
     """Produce normalized lowercase address with ordinals and abbreviations folded."""
     if not address or pd.isna(address):
         return ""
-    raw = unicodedata.normalize("NFKC", str(address).strip().lower())
+    translit = transliterate_brahmic_to_latin(str(address))
+    raw = unicodedata.normalize("NFKC", translit.strip().lower())
     raw = _PUNCTUATION_PATTERN.sub(" ", raw)
     tokens = raw.split()
     out: list[str] = []
@@ -228,6 +256,23 @@ def canonicalize_address(address: str | None) -> str:
         t = _ABBREVIATION_MAP.get(t, t)
         out.append(t)
     return " ".join(out)
+
+
+def extract_city_token(address: str | None) -> str | None:
+    """Extract candidate city or municipality clause from an address string."""
+    if not address or pd.isna(address):
+        return None
+    translit = transliterate_brahmic_to_latin(str(address))
+    raw = str(translit).strip()
+    if not raw or raw.lower() == "nan":
+        return None
+    clauses = [c.strip() for c in re.split(r"[,;\n]", raw) if c.strip()]
+    if not clauses:
+        return None
+    candidate = clauses[-2] if len(clauses) >= 2 else clauses[-1]
+    cleaned = re.sub(r"[^a-zA-Z\s]", " ", candidate).strip().lower()
+    words = [w for w in cleaned.split() if len(w) > 2]
+    return " ".join(words) if words else None
 
 
 def clean_address(address: str | None) -> str:
@@ -262,5 +307,6 @@ def widen_records_df(df: pd.DataFrame) -> pd.DataFrame:
     enriched["primary_number"] = enriched["business_address"].apply(extract_primary_number)
     enriched["postal_code"] = enriched["business_address"].apply(extract_postal_code)
     enriched["canon_address"] = enriched["business_address"].apply(canonicalize_address)
+    enriched["city_token"] = enriched["business_address"].apply(extract_city_token)
     enriched["is_addr_null"] = enriched["business_address"].isna().astype(int)
     return enriched

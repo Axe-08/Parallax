@@ -3,10 +3,10 @@ Parallax 200k Medium Benchmark Experiment Engine
 ================================================
 Unified runner for:
 - Preprocessing & widening
-- Sparse dual-channel candidate blocking with persistent Parquet caching
-- RapidFuzz pairwise feature extraction with Parquet caching
-- Hyperparameter grid sweep & threshold optimization (Fold 0 holdout)
-- Full 5-fold cross-validation with OOF prediction aggregation
+- Multi-channel sparse & phonetic candidate blocking with persistent Parquet caching
+- RapidFuzz 49-feature pairwise extraction with Parquet caching
+- Two-Pass Meta-Feature Engineering & Hyperparameter grid sweep (Fold 0 holdout)
+- Full 5-fold cross-validation with Two-Pass OOF prediction aggregation
 - Comprehensive failure logging & root-cause diagnostic reporting.
 """
 
@@ -16,7 +16,7 @@ import argparse
 import os
 import shutil
 import time
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -36,7 +36,11 @@ from parallax.diagnostics.execution_logger import (
     pipeline_stage,
 )
 from parallax.diagnostics.failure_logger import FailureDiagnosticsLogger
-from parallax.features.extractor import PairwiseFeatureExtractor
+from parallax.features.extractor import FEATURE_COLUMNS, PairwiseFeatureExtractor
+from parallax.features.meta_features import (
+    META_FEATURE_COLUMNS,
+    compute_entity_meta_features,
+)
 from parallax.metrics.evaluator import (
     evaluate_blocking_candidates,
     evaluate_resolution_predictions,
@@ -110,23 +114,28 @@ def generate_or_load_candidates(
     blocker_top_k: int = 35,
     blocker_min_sim: float = 0.15,
     checkpoint_mgr: CheckpointManager | None = None,
-) -> dict[str, set[str]]:
-    """Generate or retrieve candidate pairs mapping s1_id -> set of candidate entity_ids."""
+) -> dict[str, dict[str, float]]:
+    """Generate or retrieve candidate pairs mapping s1_id -> candidate dict with sim scores."""
     if cache_path.is_file():
         print(f"  ⚡ Found cached candidate pairs at: {cache_path}")
         t0 = time.time()
         cands_df = pd.read_parquet(cache_path)
-        candidates: dict[str, set[str]] = {s1: set() for s1 in s1_wide["entity_id"]}
+        candidates: dict[str, dict[str, float]] = {s1: {} for s1 in s1_wide["entity_id"]}
         s1_arr = cands_df["s1_id"].to_numpy()
         cand_arr = cands_df["cand_id"].to_numpy()
-        for s1, cand in zip(s1_arr, cand_arr, strict=False):
+        sim_arr = (
+            cands_df["blocking_sim"].to_numpy()
+            if "blocking_sim" in cands_df.columns
+            else np.zeros(len(cands_df), dtype=np.float32)
+        )
+        for s1, cand, sim in zip(s1_arr, cand_arr, sim_arr, strict=False):
             if s1 in candidates:
-                candidates[s1].add(cand)
+                candidates[s1][cand] = float(sim)
         print(f"  ✓ Loaded {len(cands_df):,} cached pairs in {time.time() - t0:.2f}s.\n")
         return candidates
 
     msg = (
-        f"  ⚡ Running sparse TF-IDF blocker (top_k={blocker_top_k}, min_sim={blocker_min_sim})..."
+        f"  ⚡ Running multi-channel blocker (top_k={blocker_top_k}, min_sim={blocker_min_sim})..."
     )
     print(msg)
     t0 = time.time()
@@ -151,20 +160,22 @@ def generate_or_load_candidates(
     print(f"  💾 Caching candidate pairs to: {cache_path}...")
     cache_rows_s1: list[str] = []
     cache_rows_cand: list[str] = []
+    cache_rows_sim: list[float] = []
     for s1, cands in candidates.items():
-        for cand in cands:
+        for cand, sim in cands.items():
             cache_rows_s1.append(s1)
             cache_rows_cand.append(cand)
+            cache_rows_sim.append(sim)
 
-    pd.DataFrame({"s1_id": cache_rows_s1, "cand_id": cache_rows_cand}).to_parquet(
-        cache_path, compression="snappy", index=False
-    )
+    pd.DataFrame(
+        {"s1_id": cache_rows_s1, "cand_id": cache_rows_cand, "blocking_sim": cache_rows_sim}
+    ).to_parquet(cache_path, compression="snappy", index=False)
     print("  ✓ Caching complete.\n")
     return candidates
 
 
 def extract_or_load_features(
-    candidates: Mapping[str, set[str]],
+    candidates: Mapping[str, Collection[str] | dict[str, float]],
     s1_wide: pd.DataFrame,
     target_wide: pd.DataFrame,
     gt_dict: Mapping[str, set[str]],
@@ -175,8 +186,17 @@ def extract_or_load_features(
         print(f"  ⚡ Found cached feature matrix at: {cache_path}")
         t0 = time.time()
         features_df = pd.read_parquet(cache_path)
-        print(f"  ✓ Loaded {len(features_df):,} feature rows in {time.time() - t0:.2f}s.\n")
-        return features_df
+
+        missing_cols = [c for c in FEATURE_COLUMNS if c not in features_df.columns]
+        if not missing_cols:
+            print(f"  ✓ Loaded {len(features_df):,} feature rows in {time.time() - t0:.2f}s.\n")
+            return features_df
+        preview = missing_cols[:3]
+        print(
+            f"  ⚡ Cached feature matrix missing {len(missing_cols)} features ({preview}...). "
+            "Re-extracting..."
+        )
+        del features_df
 
     print("  ⚡ Extracting RapidFuzz and structural features across candidate pairs...")
     t0 = time.time()
@@ -198,14 +218,16 @@ def run_sweep(
     val_pairs: pd.DataFrame,
     val_gt: Mapping[str, set[str]],
     checkpoint_mgr: CheckpointManager | None = None,
+    sample_s1: int | None = None,
 ) -> tuple[HyperparamConfig, float]:
     """Execute hyperparameter sweep on validation holdout to find peak Macro F0.5."""
     print("================================================================================")
     print("🔬 STAGE 4: HYPERPARAMETER GRID SWEEP (VAL HOLDOUT)")
     print("================================================================================")
 
-    if checkpoint_mgr is not None and checkpoint_mgr.has_checkpoint("sweep_results", ext="json"):
-        data = checkpoint_mgr.load_json("sweep_results")
+    sw_key = f"sweep_results_sample_{sample_s1}" if sample_s1 else "sweep_results"
+    if checkpoint_mgr is not None and checkpoint_mgr.has_checkpoint(sw_key, ext="json"):
+        data = checkpoint_mgr.load_json(sw_key)
         if data and "config" in data and "optimal_tau" in data:
             best_cfg = HyperparamConfig(**data["config"])
             base_tau = float(data["optimal_tau"])
@@ -238,6 +260,20 @@ def run_sweep(
             n_estimators=150,
         ),
         HyperparamConfig(
+            name="Config-Dense",
+            learning_rate=0.04,
+            num_leaves=63,
+            max_depth=8,
+            n_estimators=250,
+        ),
+        HyperparamConfig(
+            name="Config-XDeep",
+            learning_rate=0.04,
+            num_leaves=127,
+            max_depth=10,
+            n_estimators=250,
+        ),
+        HyperparamConfig(
             name="Config-Conservative",
             learning_rate=0.03,
             num_leaves=31,
@@ -258,22 +294,45 @@ def run_sweep(
     print(header)
     print("-" * len(header))
 
+    all_features = list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS)
+
     for cfg in tqdm(configs, desc="  ⚡ Tuning Fold 0", unit="config", leave=False):
-        matcher = LightGBMMatcher(
+        # Pass 1: Raw 49 Features
+        matcher_p1 = LightGBMMatcher(
             learning_rate=cfg.learning_rate,
             num_leaves=cfg.num_leaves,
             max_depth=cfg.max_depth,
             n_estimators=cfg.n_estimators,
+            feature_columns=FEATURE_COLUMNS,
             seed=42,
         )
-        matcher.train(train_pairs, val_pairs)
+        matcher_p1.train(train_pairs, val_pairs)
 
-        search_range = [0.60, 0.65, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90]
-        best_tau, _ = matcher.optimize_threshold(val_pairs, val_gt, search_range=search_range)
+        train_copy = train_pairs.copy()
+        val_copy = val_pairs.copy()
+        train_copy["prob"] = matcher_p1.predict_proba(train_copy)
+        val_copy["prob"] = matcher_p1.predict_proba(val_copy)
+
+        # Entity Meta-Features (Track A)
+        compute_entity_meta_features(train_copy, prob_col="prob")
+        compute_entity_meta_features(val_copy, prob_col="prob")
+
+        # Pass 2: Combined 54 Features
+        matcher_p2 = LightGBMMatcher(
+            learning_rate=cfg.learning_rate,
+            num_leaves=cfg.num_leaves,
+            max_depth=cfg.max_depth,
+            n_estimators=cfg.n_estimators,
+            feature_columns=all_features,
+            seed=1042,
+        )
+        matcher_p2.train(train_copy, val_copy)
+
+        search_range = [0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90]
+        best_tau, _ = matcher_p2.optimize_threshold(val_copy, val_gt, search_range=search_range)
 
         # Evaluate complete metrics at best tau
-        val_copy = val_pairs[["s1_id", "cand_id"]].copy()
-        val_copy["prob"] = matcher.predict_proba(val_pairs)
+        val_copy["prob"] = matcher_p2.predict_proba(val_copy)
         preds = predictor.filter_predictions(val_copy, val_s1_ids, threshold=best_tau)
         report = evaluate_resolution_predictions(val_gt, preds)
 
@@ -303,7 +362,7 @@ def run_sweep(
 
     if checkpoint_mgr is not None:
         checkpoint_mgr.save_json(
-            "sweep_results",
+            sw_key,
             {
                 "config": {
                     "name": best_sweep.config.name,
@@ -317,7 +376,7 @@ def run_sweep(
             },
         )
         checkpoint_mgr.record_stage_completed(
-            "sweep",
+            sw_key,
             {"winning_config": best_sweep.config.name, "tau": best_sweep.optimal_tau},
         )
 
@@ -331,10 +390,11 @@ def run_cross_validation(
     best_cfg: HyperparamConfig,
     base_tau: float,
     checkpoint_mgr: CheckpointManager | None = None,
+    sample_s1: int | None = None,
 ) -> tuple[list[FoldMetric], dict[str, set[str]], pd.DataFrame]:
-    """Execute 5-fold cross-validation, return fold metrics and complete OOF predictions."""
+    """Execute Two-Pass 5-fold CV, return fold metrics and complete OOF predictions."""
     print("================================================================================")
-    print("🔁 STAGE 5: FULL 5-FOLD CROSS VALIDATION")
+    print("🔁 STAGE 5: FULL 5-FOLD CROSS VALIDATION (TWO-PASS RESOLUTION)")
     print("================================================================================")
 
     # Map entity_id to fold
@@ -359,18 +419,25 @@ def run_cross_validation(
     print(header)
     print("-" * len(header))
 
+    all_features = list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS)
+
     for k in tqdm(folds, desc="  ⚡ 5-Fold Cross Validation", unit="fold", leave=False):
         val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k]["entity_id"].astype(str))
         val_gt = {k_id: v for k_id, v in gt_dict.items() if k_id in val_s1_set}
 
+        m_key = f"fold_{k}_metrics_sample_{sample_s1}" if sample_s1 else f"fold_{k}_metrics"
+        sp_key = (
+            f"fold_{k}_scored_pairs_sample_{sample_s1}" if sample_s1 else f"fold_{k}_scored_pairs"
+        )
+
         # Check for completed fold checkpoint
         if (
             checkpoint_mgr is not None
-            and checkpoint_mgr.has_checkpoint(f"fold_{k}_metrics", ext="json")
-            and checkpoint_mgr.has_checkpoint(f"fold_{k}_scored_pairs")
+            and checkpoint_mgr.has_checkpoint(m_key, ext="json")
+            and checkpoint_mgr.has_checkpoint(sp_key)
         ):
-            metric_data = checkpoint_mgr.load_json(f"fold_{k}_metrics")
-            val_pairs_scored = checkpoint_mgr.load_dataframe(f"fold_{k}_scored_pairs")
+            metric_data = checkpoint_mgr.load_json(m_key)
+            val_pairs_scored = checkpoint_mgr.load_dataframe(sp_key)
             if metric_data is not None and val_pairs_scored is not None:
                 cached_metric = FoldMetric(**metric_data)
                 fold_results.append(cached_metric)
@@ -398,30 +465,53 @@ def run_cross_validation(
         val_mask = s1_fold_arr == k
         train_mask = (s1_fold_arr != k) & (s1_fold_arr != -1)
 
-        train_pairs = features_df[train_mask]
+        train_pairs = features_df[train_mask].copy()
         val_pairs = features_df[val_mask].copy()
 
-        matcher = LightGBMMatcher(
+        # Pass 1: Raw 49 Features
+        matcher_p1 = LightGBMMatcher(
             learning_rate=best_cfg.learning_rate,
             num_leaves=best_cfg.num_leaves,
             max_depth=best_cfg.max_depth,
             n_estimators=best_cfg.n_estimators,
+            feature_columns=FEATURE_COLUMNS,
             seed=42 + k,
         )
-        matcher.train(train_pairs, val_pairs)
+        matcher_p1.train(train_pairs, val_pairs)
 
+        train_pairs["prob"] = matcher_p1.predict_proba(train_pairs)
+        val_pairs["prob"] = matcher_p1.predict_proba(val_pairs)
+
+        # Compute Entity Meta-Features (Track A)
+        compute_entity_meta_features(train_pairs, prob_col="prob")
+        compute_entity_meta_features(val_pairs, prob_col="prob")
+
+        # Pass 2: Combined 54 Features (49 + 5 Meta)
+        matcher_p2 = LightGBMMatcher(
+            learning_rate=best_cfg.learning_rate,
+            num_leaves=best_cfg.num_leaves,
+            max_depth=best_cfg.max_depth,
+            n_estimators=best_cfg.n_estimators,
+            feature_columns=all_features,
+            seed=1042 + k,
+        )
+        matcher_p2.train(train_pairs, val_pairs)
+
+        # Optimize threshold tau on Pass 2 probabilities
         search_range = [
+            base_tau - 0.12,
             base_tau - 0.08,
             base_tau - 0.04,
             base_tau,
             base_tau + 0.04,
             base_tau + 0.08,
+            base_tau + 0.12,
         ]
-        search_range = [t for t in search_range if 0.50 <= t <= 0.95]
-        best_tau_k, _ = matcher.optimize_threshold(val_pairs, val_gt, search_range=search_range)
+        search_range = [t for t in search_range if 0.45 <= t <= 0.95]
+        best_tau_k, _ = matcher_p2.optimize_threshold(val_pairs, val_gt, search_range=search_range)
 
-        # Out-of-fold inference
-        val_pairs["prob"] = matcher.predict_proba(val_pairs)
+        # Out-of-fold inference with Pass 2 probabilities
+        val_pairs["prob"] = matcher_p2.predict_proba(val_pairs)
         fold_preds = predictor.filter_predictions(val_pairs, list(val_s1_set), threshold=best_tau_k)
 
         # Merge fold predictions into OOF set
@@ -457,12 +547,10 @@ def run_cross_validation(
         fold_results.append(fold_metric)
 
         if checkpoint_mgr is not None:
-            checkpoint_mgr.save_dataframe(
-                f"fold_{k}_scored_pairs", val_pairs[["s1_id", "cand_id", "prob"]]
-            )
-            checkpoint_mgr.save_json(f"fold_{k}_metrics", asdict(fold_metric))
+            checkpoint_mgr.save_dataframe(sp_key, val_pairs[["s1_id", "cand_id", "prob"]])
+            checkpoint_mgr.save_json(m_key, asdict(fold_metric))
             checkpoint_mgr.record_stage_completed(
-                f"fold_{k}",
+                m_key,
                 {"optimal_tau": best_tau_k, "macro_f05": report.macro_f05},
             )
 
@@ -498,7 +586,7 @@ def run_benchmark(
     skip_sweep: bool = False,
     sample_s1: int | None = None,
 ) -> None:
-    """Execute complete 200k benchmark workflow."""
+    """Execute complete benchmark workflow with two-pass meta-resolution."""
     data_path = Path(data_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -507,7 +595,7 @@ def run_benchmark(
     chk_path = Path(checkpoint_dir) if checkpoint_dir else out_path / "checkpoints"
     checkpoint_mgr = CheckpointManager(chk_path, reset=reset_checkpoints)
 
-    print_banner("PARALLAX 200K BENCHMARK & ERROR DIAGNOSTICS SUITE")
+    print_banner("PARALLAX 200K BENCHMARK & ERROR DIAGNOSTICS SUITE (V3)")
     print(f"Data Source:       {data_path.resolve()}")
     print(f"Outputs:           {out_path.resolve()}")
     print(f"Diagnostic Logs:   {rep_path.resolve()}")
@@ -518,7 +606,7 @@ def run_benchmark(
     exec_logger = get_global_logger()
 
     # Step 1: Load Data
-    print("--- [Step 1: Loading 200k Benchmark Split] ---")
+    print("--- [Step 1: Loading Benchmark Split] ---")
     with pipeline_stage("Step 1: Loading Data", logger=exec_logger):
         t0 = time.time()
         s1_df = load_business_records_df(data_path / "train_source1.tsv")
@@ -528,7 +616,7 @@ def run_benchmark(
         cv_folds_df = pd.read_csv(data_path / "cv_folds_source1.tsv", sep="\t")
 
         if sample_s1 and sample_s1 < len(s1_df):
-            print(f"  ⚡ Running rapid test sample with {sample_s1:,} S1 entities...")
+            print(f"  ⚡ Running test sample with {sample_s1:,} S1 entities...")
             s1_df = s1_df.head(sample_s1).copy()
             valid_ids = set(s1_df["entity_id"])
             gt_dict = {k: v for k, v in gt_dict.items() if k in valid_ids}
@@ -562,6 +650,23 @@ def run_benchmark(
             if not reset_checkpoints and checkpoint_mgr.has_checkpoint(target_tag)
             else None
         )
+        if (
+            loaded_s1 is not None
+            and loaded_target is not None
+            and (
+                "primary_number" not in loaded_s1.columns
+                or "primary_number" not in loaded_target.columns
+                or "city_token" not in loaded_s1.columns
+                or "city_token" not in loaded_target.columns
+            )
+        ):
+            print(
+                "  ⚡ [Checkpoint] Widened tables lack v2 columns "
+                "(primary_number/city_token). Re-widening..."
+            )
+            loaded_s1 = None
+            loaded_target = None
+
         if loaded_s1 is not None and loaded_target is not None:
             print("  ⚡ [Checkpoint] Loading cached widened tables...")
             s1_wide = loaded_s1
@@ -585,10 +690,12 @@ def run_benchmark(
     exec_logger.check_memory_threshold()
 
     # Step 3: Candidate Generation (with Parquet caching)
-    print("--- [Step 3: Dual-Channel Sparse Blocking] ---")
+    print("--- [Step 3: Multi-Channel Sparse & Phonetic Blocking] ---")
     with pipeline_stage("Step 3: Candidate Blocking", logger=exec_logger):
         cand_cache = out_path / (
-            "candidate_pairs_sample.parquet" if sample_s1 else "candidate_pairs_medium_200k.parquet"
+            f"candidate_pairs_sample_{sample_s1}.parquet"
+            if sample_s1
+            else "candidate_pairs_medium_200k.parquet"
         )
         candidates = generate_or_load_candidates(
             s1_wide, target_wide, cand_cache, checkpoint_mgr=checkpoint_mgr
@@ -605,10 +712,10 @@ def run_benchmark(
     exec_logger.check_memory_threshold()
 
     # Step 4: Feature Extraction (with Parquet caching)
-    print("--- [Step 4: RapidFuzz Pairwise Feature Extraction] ---")
+    print("--- [Step 4: RapidFuzz Pairwise Feature Extraction (49 Features)] ---")
     with pipeline_stage("Step 4: Feature Extraction", logger=exec_logger):
         feat_cache = out_path / (
-            "features_sample.parquet" if sample_s1 else "features_medium_200k.parquet"
+            f"features_sample_{sample_s1}.parquet" if sample_s1 else "features_medium_200k.parquet"
         )
         features_df = extract_or_load_features(
             candidates, s1_wide, target_wide, gt_dict, feat_cache
@@ -625,17 +732,21 @@ def run_benchmark(
     with pipeline_stage("Step 5: Hyperparameter Sweep", logger=exec_logger):
         if not skip_sweep:
             best_cfg, base_tau = run_sweep(
-                train_pairs_0, val_pairs_0, val_gt_0, checkpoint_mgr=checkpoint_mgr
+                train_pairs_0,
+                val_pairs_0,
+                val_gt_0,
+                checkpoint_mgr=checkpoint_mgr,
+                sample_s1=sample_s1,
             )
         else:
             best_cfg = HyperparamConfig(
-                name="Default-Balanced",
+                name="Config-Deep",
                 learning_rate=0.05,
-                num_leaves=31,
-                max_depth=6,
+                num_leaves=63,
+                max_depth=8,
                 n_estimators=150,
             )
-            base_tau = 0.78
+            base_tau = 0.74
 
     exec_logger.check_memory_threshold()
 
@@ -648,11 +759,14 @@ def run_benchmark(
             best_cfg=best_cfg,
             base_tau=base_tau,
             checkpoint_mgr=checkpoint_mgr,
+            sample_s1=sample_s1,
         )
 
         # Save final OOF matching results
         final_tsv = out_path / (
-            "matching_results_sample.tsv" if sample_s1 else "matching_results_medium_200k.tsv"
+            f"matching_results_sample_{sample_s1}.tsv"
+            if sample_s1
+            else "matching_results_medium_200k.tsv"
         )
         write_matching_results_tsv(final_tsv, oof_predictions)
         print(f"💾 Full Out-Of-Fold Predictions saved to: {final_tsv}")
@@ -667,8 +781,12 @@ def run_benchmark(
         oof_report = evaluate_resolution_predictions(gt_dict, oof_predictions)
 
         logger = FailureDiagnosticsLogger(reports_dir=rep_path)
-        log_name = "failures_sample.jsonl" if sample_s1 else "failures_medium_200k.jsonl"
-        summary_name = "diagnostics_sample.md" if sample_s1 else "diagnostics_medium_200k.md"
+        log_name = (
+            f"failures_sample_{sample_s1}.jsonl" if sample_s1 else "failures_medium_200k.jsonl"
+        )
+        summary_name = (
+            f"diagnostics_sample_{sample_s1}.md" if sample_s1 else "diagnostics_medium_200k.md"
+        )
         failures = logger.analyze_and_log_failures(
             ground_truth=gt_dict,
             candidates=candidates,
@@ -690,7 +808,7 @@ def run_benchmark(
     bfn_cnt = by_type.get("BLOCKING_FALSE_NEGATIVE", 0)
     cfn_cnt = by_type.get("CLASSIFICATION_FALSE_NEGATIVE", 0)
 
-    print("Failure Breakdown Across All 200,000 Entities:")
+    print(f"Failure Breakdown Across All {len(s1_df):,} Entities:")
     print(f"  🚨 FALSE MERGE POSITIVES:          {fp_cnt:,}  (Distractors; 2x penalty)")
     print(f"  🚨 SINGLETON VIOLATIONS:           {sing_cnt:,}  (Singletons given matches)")
     print(f"  ⚠️  BLOCKING FALSE NEGATIVES:       {bfn_cnt:,}  (Dropped at blocking)")
@@ -702,7 +820,7 @@ def run_benchmark(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Parallax 200k Medium Benchmark Runner")
+    parser = argparse.ArgumentParser(description="Parallax Benchmark Runner (v3)")
     parser.add_argument("--data-dir", default="data/medium_split_200k", help="Dataset directory")
     parser.add_argument(
         "--output-dir", default="output", help="Output directory for predictions and cache"

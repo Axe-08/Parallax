@@ -7,7 +7,7 @@ for the Amazon ML Challenge 2026 Business Entity Resolution task.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from enum import Enum
 from pathlib import Path
 
@@ -151,7 +151,7 @@ def load_ground_truth_dict(file_path: Path | str) -> dict[str, set[str]]:
 
 def write_candidate_pairs_tsv(
     output_path: Path | str,
-    candidates: Mapping[str, set[str] | list[str]],
+    candidates: Mapping[str, Collection[str]],
 ) -> None:
     """
     Write candidate_pairs.tsv matching official competition format:

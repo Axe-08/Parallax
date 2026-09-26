@@ -9,9 +9,18 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from parallax.features.extractor import FEATURE_COLUMNS, PairwiseFeatureExtractor
+from parallax.features.extractor import (
+    FEATURE_COLUMNS,
+    PairwiseFeatureExtractor,
+    extract_core_and_suffix,
+)
+from parallax.features.meta_features import (
+    META_FEATURE_COLUMNS,
+    compute_entity_meta_features,
+)
 from parallax.preprocessing.normalizer import (
     canonicalize_address,
+    extract_city_token,
     extract_numbers,
     extract_postal_code,
     extract_primary_number,
@@ -20,8 +29,8 @@ from parallax.preprocessing.normalizer import (
 
 
 def test_feature_columns_count():
-    """Verify that FEATURE_COLUMNS contains exactly 28 features."""
-    assert len(FEATURE_COLUMNS) == 28
+    """Verify that FEATURE_COLUMNS contains exactly 49 features."""
+    assert len(FEATURE_COLUMNS) == 49
     # Baseline 13 features must remain in exact initial order
     baseline_13 = [
         "raw_name_ratio",
@@ -39,6 +48,10 @@ def test_feature_columns_count():
         "len_ratio_name",
     ]
     assert FEATURE_COLUMNS[:13] == baseline_13
+    assert "translit_boost_name" in FEATURE_COLUMNS
+    assert "name_core_ratio" in FEATURE_COLUMNS
+    assert "phonetic_name_match" in FEATURE_COLUMNS
+    assert "blocking_sim_score" in FEATURE_COLUMNS
 
 
 def test_primary_number_street_conflict_with_shared_unit():
@@ -282,3 +295,323 @@ def test_alphanumeric_flat_formats():
     assert extract_primary_number("Bangalore, 4A, Gold Nest, Wind Tunnel Road") == "4a"
     assert extract_primary_number("Flat H-1, Rohan Garima, Pune") == "h1"
     assert extract_primary_number("303-A, Nbc Complex, Sector 11, Navi Mumbai") == "303a"
+
+
+def test_primary_num_distance():
+    """Test primary_num_distance for matching, conflicting, and missing numbers."""
+    s1_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S1-1",
+                    "business_name": "Clinic Alpha",
+                    "business_address": "5 Central Market, Delhi",
+                    "country": "India",
+                },
+                {
+                    "entity_id": "S1-2",
+                    "business_name": "Custom Special",
+                    "business_address": "2693 Fairfield Pike, Wartrace, TN",
+                    "country": "US",
+                },
+            ]
+        )
+    )
+    cand_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S2-1",
+                    "business_name": "Clinic Beta",
+                    "business_address": "9 Central Market, Delhi",
+                    "country": "India",
+                },
+                {
+                    "entity_id": "S2-2",
+                    "business_name": "Custom Special Co",
+                    "business_address": "2698 Fairfield Pike, Wartrace, TN",
+                    "country": "US",
+                },
+            ]
+        )
+    )
+    extractor = PairwiseFeatureExtractor()
+    feat_df = extractor.extract_features_df(
+        {"S1-1": {"S2-1"}, "S1-2": {"S2-2"}}, s1_df, cand_df, show_progress=False
+    )
+    row_5_9 = feat_df[feat_df["s1_id"] == "S1-1"].iloc[0]
+    row_close = feat_df[feat_df["s1_id"] == "S1-2"].iloc[0]
+
+    # 5 vs 9 has significant distance (>= 0.4)
+    assert row_5_9["primary_num_distance"] >= 0.4
+    assert row_5_9["primary_num_conflict"] == 1.0
+
+    # 2693 vs 2698 has low distance (<= 0.25)
+    assert row_close["primary_num_distance"] <= 0.25
+    assert row_close["primary_num_conflict"] == 1.0
+
+
+def test_city_token_extraction_and_matching():
+    """Test city extraction, match, and conflict features."""
+    addr_us_s1 = "18 Ash Street, Danvers, MA"
+    addr_us_cand_match = "18 Ash Street, Danvers, MA"
+    addr_us_cand_conflict = "18 Ash Street, Boston, MA"
+
+    assert extract_city_token(addr_us_s1) == "danvers"
+    assert extract_city_token(addr_us_cand_conflict) == "boston"
+
+    s1_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S1-1",
+                    "business_name": "Bakery",
+                    "business_address": addr_us_s1,
+                    "country": "US",
+                }
+            ]
+        )
+    )
+    cand_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S2-1",
+                    "business_name": "Bakery",
+                    "business_address": addr_us_cand_match,
+                    "country": "US",
+                },
+                {
+                    "entity_id": "S2-2",
+                    "business_name": "Bakery",
+                    "business_address": addr_us_cand_conflict,
+                    "country": "US",
+                },
+            ]
+        )
+    )
+    extractor = PairwiseFeatureExtractor()
+    feat_df = extractor.extract_features_df(
+        {"S1-1": {"S2-1", "S2-2"}}, s1_df, cand_df, show_progress=False
+    )
+    match_row = feat_df[feat_df["cand_id"] == "S2-1"].iloc[0]
+    conflict_row = feat_df[feat_df["cand_id"] == "S2-2"].iloc[0]
+
+    assert match_row["city_match"] == 1.0
+    assert match_row["city_conflict"] == 0.0
+
+    assert conflict_row["city_match"] == 0.0
+    assert conflict_row["city_conflict"] == 1.0
+
+
+def test_missing_address_interaction_features():
+    """Test null-address interaction feature values when address is present vs missing."""
+    s1_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S1-1",
+                    "business_name": "Acme Global Solutions",
+                    "business_address": "100 Market St, San Francisco, CA",
+                    "country": "US",
+                }
+            ]
+        )
+    )
+    cand_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S2-1",
+                    "business_name": "Acme Global Solutions LLC",
+                    "business_address": None,
+                    "country": "US",
+                },
+                {
+                    "entity_id": "S2-2",
+                    "business_name": "Acme Global Solutions LLC",
+                    "business_address": "100 Market St, San Francisco, CA",
+                    "country": "US",
+                },
+            ]
+        )
+    )
+    extractor = PairwiseFeatureExtractor()
+    feat_df = extractor.extract_features_df(
+        {"S1-1": {"S2-1", "S2-2"}}, s1_df, cand_df, show_progress=False
+    )
+
+    null_addr_row = feat_df[feat_df["cand_id"] == "S2-1"].iloc[0]
+    present_addr_row = feat_df[feat_df["cand_id"] == "S2-2"].iloc[0]
+
+    # For null candidate address:
+    assert null_addr_row["is_cand_addr_null"] == 1.0
+    assert null_addr_row["name_ratio_null_cand_addr"] == null_addr_row["soft_name_ratio"]
+    assert null_addr_row["name_ratio_null_either_addr"] == null_addr_row["soft_name_ratio"]
+    assert null_addr_row["high_conf_name_no_addr"] == 1.0
+
+    # For present address:
+    assert present_addr_row["is_cand_addr_null"] == 0.0
+    assert present_addr_row["name_ratio_null_cand_addr"] == 0.0
+    assert present_addr_row["name_ratio_null_either_addr"] == 0.0
+    assert present_addr_row["high_conf_name_no_addr"] == 0.0
+
+
+def test_indian_state_canonicalization():
+    """Test that canonicalize_address standardizes Indian state abbreviations and Indic scripts."""
+    c1 = canonicalize_address("Kolkata, WB")
+    c2 = canonicalize_address("Door No 73 Suryoday Vihar, Thane, महाराष्ट्र")
+    c3 = canonicalize_address("Bangalore, KA")
+
+    assert "west bengal" in c1
+    assert "maharashtra" in c2
+    assert "karnataka" in c3
+
+
+def test_legal_suffix_and_core_extraction():
+    """Test prefix and legal suffix stripping and matching."""
+    core1, s1 = extract_core_and_suffix("dr dandekar vidyalaya industries")
+    assert core1 == "dandekar vidyalaya"
+    assert s1 == "industries"
+
+    core2, s2 = extract_core_and_suffix("dandekar vidyalaya")
+    assert core2 == "dandekar vidyalaya"
+    assert s2 is None
+
+    core3, s3 = extract_core_and_suffix("m/s custom special pvt ltd")
+    assert core3 == "custom special"
+    assert s3 == "ltd"
+
+    # End-to-end extraction test
+    s1_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S1-1",
+                    "business_name": "Custom Special LLC",
+                    "business_address": None,
+                    "country": "US",
+                }
+            ]
+        )
+    )
+    cand_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S2-1",
+                    "business_name": "The Custom Special Inc",
+                    "business_address": None,
+                    "country": "US",
+                },
+                {
+                    "entity_id": "S2-2",
+                    "business_name": "Custom Special LLC",
+                    "business_address": None,
+                    "country": "US",
+                },
+            ]
+        )
+    )
+    extractor = PairwiseFeatureExtractor()
+    feat_df = extractor.extract_features_df(
+        {"S1-1": {"S2-1", "S2-2"}}, s1_df, cand_df, show_progress=False
+    )
+
+    row_inc = feat_df[feat_df["cand_id"] == "S2-1"].iloc[0]
+    row_llc = feat_df[feat_df["cand_id"] == "S2-2"].iloc[0]
+
+    assert row_inc["name_core_ratio"] == 1.0
+    assert row_inc["suffix_match"] == 0.0  # LLC vs Inc conflict
+    assert row_llc["suffix_match"] == 1.0  # LLC vs LLC match
+
+
+def test_transliteration_and_cross_script_features():
+    """Test cross script detection and transliteration boost."""
+    s1_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S1-1",
+                    "business_name": "Creative Logistics",
+                    "business_address": None,
+                    "country": "India",
+                }
+            ]
+        )
+    )
+    cand_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S2-1",
+                    "business_name": "क्रिएटिव लॉजिस्टिक्स",
+                    "business_address": None,
+                    "country": "India",
+                }
+            ]
+        )
+    )
+    extractor = PairwiseFeatureExtractor()
+    feat_df = extractor.extract_features_df({"S1-1": {"S2-1"}}, s1_df, cand_df, show_progress=False)
+
+    row = feat_df.iloc[0]
+    assert row["is_cross_script"] == 1.0
+    assert row["translit_name_ratio"] > 0.70
+    assert row["translit_boost_name"] > 0.0
+
+
+def test_phonetic_and_edit_features():
+    """Test phonetic similarity and edit geometry features."""
+    s1_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S1-1",
+                    "business_name": "Phonetic Dental Clinic",
+                    "business_address": None,
+                    "country": "US",
+                }
+            ]
+        )
+    )
+    cand_df = widen_records_df(
+        pd.DataFrame(
+            [
+                {
+                    "entity_id": "S2-1",
+                    "business_name": "Fonetic Dental Care",
+                    "business_address": None,
+                    "country": "US",
+                }
+            ]
+        )
+    )
+    extractor = PairwiseFeatureExtractor()
+    feat_df = extractor.extract_features_df({"S1-1": {"S2-1"}}, s1_df, cand_df, show_progress=False)
+
+    row = feat_df.iloc[0]
+    assert row["phonetic_name_match"] == 1.0
+    assert row["common_prefix_len"] == 0.0  # P vs F
+    assert row["name_edit_distance"] > 0
+
+
+def test_entity_meta_features():
+    """Test computation of 5 entity-level meta-features."""
+    df = pd.DataFrame(
+        {
+            "s1_id": ["S1-1", "S1-1", "S1-1", "S1-2"],
+            "cand_id": ["C1", "C2", "C3", "C4"],
+            "prob": [0.90, 0.40, 0.20, 0.75],
+        }
+    )
+    res = compute_entity_meta_features(df, prob_col="prob", s1_id_col="s1_id")
+
+    for col in META_FEATURE_COLUMNS:
+        assert col in res.columns
+
+    s1_rows = res[res["s1_id"] == "S1-1"]
+    assert pytest.approx(s1_rows["s1_max_score"].iloc[0], 0.01) == 0.90
+    assert pytest.approx(s1_rows["score_gap_to_best"].iloc[0], 0.01) == 0.0  # Top cand has 0 gap
+    assert pytest.approx(s1_rows["score_gap_to_best"].iloc[1], 0.01) == 0.50
+    assert s1_rows["score_rank_pct"].iloc[0] < s1_rows["score_rank_pct"].iloc[1]

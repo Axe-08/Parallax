@@ -8,7 +8,7 @@ Official competition metrics engine for Amazon ML Challenge 2026:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -118,7 +118,7 @@ def evaluate_resolution_predictions(
 
 def evaluate_blocking_candidates(
     ground_truth: Mapping[str, set[str]],
-    candidates: Mapping[str, set[str]],
+    candidates: Mapping[str, Collection[str]],
     total_target_records: int,
 ) -> BlockingReport:
     """
@@ -135,7 +135,7 @@ def evaluate_blocking_candidates(
     cand_counts: list[int] = []
 
     for s1_id, true_set in ground_truth.items():
-        cands = candidates.get(s1_id, set())
+        cands = set(candidates.get(s1_id, ()))
         cand_counts.append(len(cands))
         captured_true_pairs += len(true_set.intersection(cands))
 
