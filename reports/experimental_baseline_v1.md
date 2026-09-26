@@ -10,12 +10,13 @@ By freezing the data, candidate pool, and exact feature matrix, we guarantee tha
 
 ## 2. Git Information
 - **Branch**: `feature/v2-blocking-and-features`
-- **Commit**: `94604f3debccb13602c6125569c16d48c3ce66ae` (plus baseline freezing modifications)
+- **Commit**: `d95c874` (plus baseline freezing modifications)
 - **Tag**: `parallax-experimental-baseline-v1`
 
 ## 3. Dataset & Version
 - **Dataset**: 5K Golden Split (`data/medium_split_200k/`)
 - **Records**: Exact `train_source1.tsv` (Head 5,000 rows) against `train_source2.tsv` and `train_source3.tsv`.
+- **Target Pool Size**: 1,000,000 entities
 
 ## 4. Blocker Configuration
 The `DualChannelTFIDFBlocker` is frozen with the following parameters:
@@ -25,8 +26,8 @@ The `DualChannelTFIDFBlocker` is frozen with the following parameters:
 - **Channel D (Translit)**: DISABLED (`translit_top_k=0`).
 
 ## 5. Candidate Counts
-- **Total Candidate Pairs Generated**: [TBD]
-- **Average Candidates per S1**: [TBD]
+- **Total Candidate Pairs Generated**: 213,023
+- **Average Candidates per S1**: 42.60
 - **Cached Location**: `baseline_artifacts/candidate_pairs_sample.parquet`
 
 ## 6. Feature Manifest
@@ -74,8 +75,8 @@ Exactly 28 pairwise features are extracted and frozen.
 ## 7. Model Configuration
 - **Matcher**: LightGBM (Baseline implementation)
 - **Parameters**: Found via threshold sweep on Fold 0.
-- **Winner Config**: [TBD]
-- **Optimal Tau**: [TBD]
+- **Winner Config**: Config-Fast (lr=0.08, leaves=31, depth=6, estimators=100)
+- **Optimal Tau**: 0.74
 
 ## 8. Evaluation Protocol
 - **Validation Scheme**: 5-Fold Cross Validation.
@@ -83,16 +84,15 @@ Exactly 28 pairwise features are extracted and frozen.
 - **Gate**: SingletonGatedPredictor is applied identically for all evaluations.
 
 ## 9. Baseline Metrics (5-Fold CV on 5K Split)
-- **Macro F0.5**: [TBD]
-- **Precision**: [TBD]
-- **Recall**: [TBD]
-- **True Positives**: [TBD]
-- **Classification FNs**: [TBD]
-- **Blocking FNs**: [TBD]
-- **False Merges**: [TBD]
-- **Singleton Accuracy**: [TBD]
-- **Singleton Violations**: [TBD]
-- **Runtime**: [TBD]
+- **Macro F0.5**: 0.9591 ± 0.0039
+- **Singleton Accuracy**: 97.35%
+- **Non-Singleton F0.5**: 0.9583
+- **Precision**: ~98.96%
+- **Recall**: ~90.24%
+- **Classification FNs**: 1,293 (Model score < tau)
+- **Blocking FNs**: 396 (Dropped at blocking)
+- **False Merges**: 157 (Distractors)
+- **Singleton Violations**: 8
 
 ## 10. Frozen Assumptions
 - The candidate set generation is purely deterministic for the given data split.
