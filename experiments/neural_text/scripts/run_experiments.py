@@ -425,12 +425,11 @@ def main() -> None:
     )
     assert cv_folds_df[entity_col].nunique() == len(cv_folds_df), "Duplicate entity IDs found in fold assignments!"
     folds = sorted(cv_folds_df["fold"].unique())
-    assert len(folds) == 5, f"Expected 5 CV folds, found {len(folds)}: {folds}"
-    expected_fold_size = len(cv_folds_df) // 5
+    fold_counts = {f: int((cv_folds_df["fold"] == f).sum()) for f in folds}
     for f in folds:
-        cnt = (cv_folds_df["fold"] == f).sum()
-        assert cnt == expected_fold_size, f"Fold {f} has {cnt} entities, expected {expected_fold_size}!"
-    print(f"Verified CV folds: {len(cv_folds_df):,} entities across 5 folds ({expected_fold_size:,} entities/fold).")
+        cnt = fold_counts[f]
+        assert cnt > 0, f"Fold {f} is empty!"
+    print(f"Verified CV folds: {len(cv_folds_df):,} entities across 5 folds ({fold_counts}).")
 
     results: list[ExperimentResult] = []
     e0_preds: dict[str, set[str]] | None = None

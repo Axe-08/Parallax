@@ -191,7 +191,7 @@ def run_qwen_cache_generation(
 
     if resume and output_path.exists():
         try:
-            data = np.load(output_path, allow_pickle=False)
+            data = np.load(output_path, allow_pickle=True)
             existing_ids = list(data["entity_ids"].astype(str))
             existing_embeddings = data["embeddings"]
             print(f"Loaded existing cache with {len(existing_ids):,} entities from {output_path}.")

@@ -70,7 +70,7 @@ def load_qwen_embeddings(cache_path: Path) -> tuple[dict[str, int], np.ndarray]:
         print(f"Warning: Qwen cache {cache_path} does not exist. Returning empty matrix.")
         return {}, np.empty((0, 1024), dtype=np.float32)
 
-    data = np.load(cache_path, allow_pickle=False)
+    data = np.load(cache_path, allow_pickle=True)
     entity_ids = data["entity_ids"].astype(str)
     embeddings = data["embeddings"].astype(np.float32)
 
