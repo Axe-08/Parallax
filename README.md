@@ -9,6 +9,7 @@ Built with strict separation of control, deterministic data pipelines, multi-tie
 ## 🧭 Quick Links
 
 * 📖 **Team Battle Manual:** [TEAM_MANUAL.md](file:///home/akshit/Projects/hackathon/Parallax/TEAM_MANUAL.md) *(Pre-flight checklists, AWS setup, Kaggle fallback, and Hour-by-Hour timeline)*
+* ⚡ **DGX Parallelization Guide:** [docs/DGX_PARALLELIZATION_GUIDE.md](file:///home/akshit/Projects/hackathon/Parallax/docs/DGX_PARALLELIZATION_GUIDE.md) *(Multi-processing patterns, zero-copy IPC, OpenMP NUMA thread bounding)*
 * 📜 **AI Constitution & Directives:** [GEMINI.md](file:///home/akshit/Projects/hackathon/Parallax/GEMINI.md)
 * 🏛️ **Obsidian Vault Hub:** `~/Vault/1-Projects/Parallax/Parallax-Hub.md`
 

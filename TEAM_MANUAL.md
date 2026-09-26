@@ -76,10 +76,12 @@ uv run python -m parallax.utils.s3_sync list
 │ Heavy CPU Data Prep & S3       │ AWS EC2 (c6i.xlarge Spot) [Credits]   │
 │ Day 1 GPU Prototyping          │ Kaggle (90h Free T4 / 2x T4 GPUs)     │
 │ Asynchronous Full Downloads    │ AWS EC2 Background Detached tmux      │
-│ Day 2 Heavy 5-Fold Training    │ College DGX Cluster (A100 / V100)     │
+│ Day 2 Heavy 5-Fold Training    │ College DGX Cluster (A100 / 80-CPU)   │
 │ Final Ensembling & Submission  │ Local + Kaggle / AWS G4dn             │
 └────────────────────────────────┴───────────────────────────────────────┘
 ```
+
+> 💡 **DGX Parallelization Guide:** See [docs/DGX_PARALLELIZATION_GUIDE.md](file:///home/akshit/Projects/hackathon/Parallax/docs/DGX_PARALLELIZATION_GUIDE.md) for code patterns, zero-copy `fork` IPC, and NUMA OpenMP thread bounding rules to maximize DGX resource utilization.
 
 ### Team Roles & Responsibilities
 
