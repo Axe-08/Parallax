@@ -321,6 +321,7 @@ def run_sweep(
             n_estimators=cfg.n_estimators,
             feature_columns=FEATURE_COLUMNS,
             seed=42,
+            num_threads=8,
         )
         matcher_p1.train(train_pairs, val_pairs)
 
@@ -341,6 +342,7 @@ def run_sweep(
             n_estimators=cfg.n_estimators,
             feature_columns=all_features,
             seed=1042,
+            num_threads=8,
         )
         matcher_p2.train(train_copy, val_copy)
 
