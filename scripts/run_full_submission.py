@@ -154,7 +154,8 @@ def main() -> None:
     metadata = train_production_pipeline(
         train_dir=raw_train_dir,
         output_dir=project_root / "output",
-        holdout_size=50_000,
+        holdout_size=5_000,
+        sample_queries_per_country=15_000,
     )
     t_train_elapsed = time.time() - t_train_start
     print(f"  ✓ Production training finished in {t_train_elapsed / 60:.1f} minutes.")

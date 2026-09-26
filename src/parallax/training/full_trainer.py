@@ -260,8 +260,8 @@ def build_country_training_pairs(
 def train_production_pipeline(
     train_dir: Path,
     output_dir: Path,
-    holdout_size: int = 50_000,
-    sample_queries_per_country: int = 150_000,
+    holdout_size: int = 5_000,
+    sample_queries_per_country: int = 15_000,
     seed: int = 42,
 ) -> ProductionModelMetadata:
     """

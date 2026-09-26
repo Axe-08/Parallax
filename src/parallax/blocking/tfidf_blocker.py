@@ -132,10 +132,10 @@ class DualChannelTFIDFBlocker:
         )
         if any(a.strip() for a in tgt_addrs):
             min_df_addr = 2 if n_targets > 500 else 1
-            max_df_addr = 0.05 if n_targets > 500 else 1.0
+            max_df_addr = 0.02 if n_targets > 500 else 1.0
             self.vec_addr = TfidfVectorizer(
-                analyzer="char",
-                ngram_range=(3, 3),
+                analyzer="word",
+                ngram_range=(1, 2),
                 min_df=min_df_addr,
                 max_df=max_df_addr,
                 sublinear_tf=True,
