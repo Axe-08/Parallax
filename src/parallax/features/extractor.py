@@ -9,8 +9,10 @@ and entity-level context.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 from collections.abc import Collection, Mapping
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 
 import jellyfish
@@ -170,6 +172,30 @@ FEATURE_COLUMNS = [
     "blocking_sim_score",
 ]
 
+_CURRENT_EXTRACTOR: PairwiseFeatureExtractor | None = None
+_CURRENT_S1_DICT: Mapping[str, Any] | None = None
+_CURRENT_TARGET_DICT: Mapping[str, Any] | None = None
+_CURRENT_GT: Mapping[str, set[str]] | None = None
+
+
+def _worker_extract_features(
+    chunk_cand_dict: dict[str, Any],
+) -> pd.DataFrame:
+    global _CURRENT_EXTRACTOR, _CURRENT_S1_DICT, _CURRENT_TARGET_DICT, _CURRENT_GT
+    if (
+        _CURRENT_EXTRACTOR is None
+        or _CURRENT_S1_DICT is None
+        or _CURRENT_TARGET_DICT is None
+    ):
+        raise RuntimeError("Worker process lost extractor context.")
+    return _CURRENT_EXTRACTOR._extract_features_serial(
+        chunk_cand_dict,
+        s1_dict=_CURRENT_S1_DICT,
+        target_dict=_CURRENT_TARGET_DICT,
+        ground_truth=_CURRENT_GT,
+        show_progress=False,
+    )
+
 
 class PairwiseFeatureExtractor:
     """Extracts comparative similarity features for candidate pairs."""
@@ -323,11 +349,13 @@ class PairwiseFeatureExtractor:
         ground_truth: Mapping[str, set[str]] | None = None,
         show_progress: bool = True,
         target_lookup: Mapping[str, Any] | None = None,
+        n_jobs: int = 1,
     ) -> pd.DataFrame:
         """
         Build a tabular feature matrix for all candidate pairs.
         If ground_truth is provided, appends the binary target column.
         Accepts either target_df or precomputed target_lookup to maximize throughput.
+        When n_jobs > 1, chunks candidate pairs across worker processes.
         """
         needed_s1 = set(candidate_pairs.keys())
         s1_dict = self.build_record_lookup(s1_df, needed_ids=needed_s1)
@@ -341,6 +369,70 @@ class PairwiseFeatureExtractor:
             needed_target = {cand for cands in candidate_pairs.values() for cand in cands}
             target_dict = self.build_record_lookup(target_df, needed_ids=needed_target)
 
+        total_pairs = sum(len(cands) for cands in candidate_pairs.values())
+        if total_pairs == 0:
+            cols = ["s1_id", "cand_id", *FEATURE_COLUMNS]
+            if ground_truth is not None:
+                cols.append("target")
+            return pd.DataFrame(columns=cols)
+
+        if (
+            n_jobs <= 1
+            or len(candidate_pairs) < 1000
+            or "fork" not in multiprocessing.get_all_start_methods()
+        ):
+            return self._extract_features_serial(
+                candidate_pairs,
+                s1_dict=s1_dict,
+                target_dict=target_dict,
+                ground_truth=ground_truth,
+                show_progress=show_progress,
+            )
+
+        # Multi-process parallelization with copy-on-write shared lookups
+        s1_keys = list(candidate_pairs.keys())
+        chunks = np.array_split(s1_keys, n_jobs)
+        chunk_cand_dicts = [
+            {k: candidate_pairs[k] for k in chunk if k in candidate_pairs}
+            for chunk in chunks
+        ]
+        valid_chunks = [cd for cd in chunk_cand_dicts if len(cd) > 0]
+        if len(valid_chunks) <= 1:
+            return self._extract_features_serial(
+                candidate_pairs,
+                s1_dict=s1_dict,
+                target_dict=target_dict,
+                ground_truth=ground_truth,
+                show_progress=show_progress,
+            )
+
+        global _CURRENT_EXTRACTOR, _CURRENT_S1_DICT, _CURRENT_TARGET_DICT, _CURRENT_GT
+        _CURRENT_EXTRACTOR = self
+        _CURRENT_S1_DICT = s1_dict
+        _CURRENT_TARGET_DICT = target_dict
+        _CURRENT_GT = ground_truth
+
+        ctx = multiprocessing.get_context("fork")
+        try:
+            with ProcessPoolExecutor(max_workers=len(valid_chunks), mp_context=ctx) as executor:
+                chunk_dfs = list(executor.map(_worker_extract_features, valid_chunks))
+        finally:
+            _CURRENT_EXTRACTOR = None
+            _CURRENT_S1_DICT = None
+            _CURRENT_TARGET_DICT = None
+            _CURRENT_GT = None
+
+        return pd.concat(chunk_dfs, ignore_index=True)
+
+    def _extract_features_serial(
+        self,
+        candidate_pairs: Mapping[str, Collection[str] | Mapping[str, float]],
+        s1_dict: Mapping[str, Any],
+        target_dict: Mapping[str, Any],
+        ground_truth: Mapping[str, set[str]] | None = None,
+        show_progress: bool = True,
+    ) -> pd.DataFrame:
+        """Extract pairwise features for candidate pairs sequentially."""
         total_pairs = sum(len(cands) for cands in candidate_pairs.values())
         if total_pairs == 0:
             cols = ["s1_id", "cand_id", *FEATURE_COLUMNS]

@@ -13,9 +13,12 @@ High-recall, memory-efficient candidate generator:
 
 from __future__ import annotations
 
+import functools
 import gc
+import multiprocessing
 from collections import defaultdict
 from collections.abc import Collection, Mapping
+from concurrent.futures import ProcessPoolExecutor
 from typing import TYPE_CHECKING
 
 import jellyfish
@@ -30,6 +33,26 @@ from parallax.preprocessing.transliteration import transliterate_brahmic_to_lati
 
 if TYPE_CHECKING:
     from parallax.utils.checkpoint_manager import CheckpointManager
+
+_CURRENT_BLOCKER: DualChannelTFIDFBlocker | None = None
+
+
+def _worker_block_chunk(
+    chunk_df: pd.DataFrame,
+    country: str,
+    batch_size: int | None,
+    max_candidates_per_query: int | None,
+) -> dict[str, dict[str, float]]:
+    global _CURRENT_BLOCKER
+    if _CURRENT_BLOCKER is None:
+        raise RuntimeError("Worker process lost blocker reference.")
+    return _CURRENT_BLOCKER._block_queries_serial(
+        chunk_df,
+        country=country,
+        batch_size=batch_size,
+        max_candidates_per_query=max_candidates_per_query,
+        show_progress=False,
+    )
 
 
 def build_blocking_texts(
@@ -72,7 +95,8 @@ class DualChannelTFIDFBlocker:
         addr_min_sim: float = 0.20,
         batch_size: int = 1000,
         show_progress: bool = True,
-        max_candidates_per_query: int = 15,
+        max_candidates_per_query: int = 35,
+        n_jobs: int = 1,
     ) -> None:
         self.name_top_k = name_top_k
         self.addr_top_k = addr_top_k
@@ -81,6 +105,7 @@ class DualChannelTFIDFBlocker:
         self.batch_size = batch_size
         self.show_progress = show_progress
         self.max_candidates_per_query = max_candidates_per_query
+        self.n_jobs = n_jobs
 
         # Stateful index storage for current country partition
         self.indexed_country: str | None = None
@@ -207,16 +232,17 @@ class DualChannelTFIDFBlocker:
 
         gc.collect()
 
-    def block_queries(
+    def _block_queries_serial(
         self,
         s1_c: pd.DataFrame,
         country: str = "",
         batch_size: int | None = None,
         max_candidates_per_query: int | None = None,
+        show_progress: bool | None = None,
     ) -> dict[str, dict[str, float]]:
         """
-        Generate candidate pairs for queries against pre-indexed targets.
-        Streams in micro-batches (default 50) to bound RAM under 100 MB per batch.
+        Generate candidate pairs for queries against pre-indexed targets sequentially.
+        Streams in micro-batches (default 1000) to bound RAM under 100 MB per batch.
         """
         if self.tgt_name_mat is None or self.vec_name is None:
             raise RuntimeError("Targets have not been indexed! Call index_country_targets() first.")
@@ -241,7 +267,7 @@ class DualChannelTFIDFBlocker:
             desc=f"  ⚡ Blocking [{country or self.indexed_country}]",
             unit="batch",
             leave=False,
-            disable=not self.show_progress,
+            disable=not (show_progress if show_progress is not None else self.show_progress),
         )
 
         for start_idx in pbar:
@@ -431,6 +457,62 @@ class DualChannelTFIDFBlocker:
 
         return candidate_pairs
 
+    def block_queries(
+        self,
+        s1_c: pd.DataFrame,
+        country: str = "",
+        batch_size: int | None = None,
+        max_candidates_per_query: int | None = None,
+        n_jobs: int | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """
+        Generate candidate pairs for queries against pre-indexed targets.
+        When n_jobs > 1 and len(s1_c) >= 2000, parallelizes query batches
+        across worker processes using copy-on-write shared target matrices.
+        """
+        effective_n_jobs = n_jobs if n_jobs is not None else self.n_jobs
+        if (
+            effective_n_jobs <= 1
+            or len(s1_c) < 2000
+            or "fork" not in multiprocessing.get_all_start_methods()
+        ):
+            return self._block_queries_serial(
+                s1_c,
+                country=country,
+                batch_size=batch_size,
+                max_candidates_per_query=max_candidates_per_query,
+            )
+
+        global _CURRENT_BLOCKER
+        _CURRENT_BLOCKER = self
+        chunks = np.array_split(s1_c, effective_n_jobs)
+        valid_chunks = [c for c in chunks if len(c) > 0]
+        if len(valid_chunks) <= 1:
+            return self._block_queries_serial(
+                s1_c,
+                country=country,
+                batch_size=batch_size,
+                max_candidates_per_query=max_candidates_per_query,
+            )
+
+        ctx = multiprocessing.get_context("fork")
+        worker_fn = functools.partial(
+            _worker_block_chunk,
+            country=country,
+            batch_size=batch_size,
+            max_candidates_per_query=max_candidates_per_query,
+        )
+        try:
+            with ProcessPoolExecutor(max_workers=len(valid_chunks), mp_context=ctx) as executor:
+                chunk_results = list(executor.map(worker_fn, valid_chunks))
+        finally:
+            _CURRENT_BLOCKER = None
+
+        candidate_pairs: dict[str, dict[str, float]] = {}
+        for cr in chunk_results:
+            candidate_pairs.update(cr)
+        return candidate_pairs
+
     def clear_index(self) -> None:
         """Explicitly deallocate target indices and reclaim memory."""
         self.indexed_country = None
@@ -453,6 +535,7 @@ class DualChannelTFIDFBlocker:
         s1_df: pd.DataFrame,
         target_df: pd.DataFrame,
         checkpoint_mgr: CheckpointManager | None = None,
+        n_jobs: int | None = None,
     ) -> dict[str, dict[str, float]]:
         """
         Generate candidate pairs partitioned by country using stateful lifecycle.
@@ -493,8 +576,8 @@ class DualChannelTFIDFBlocker:
             # Index country targets once
             self.index_country_targets(tgt_c, country=country)
 
-            # Block queries in micro-batches
-            country_cands = self.block_queries(s1_c, country=country)
+            # Block queries in micro-batches (parallelized when n_jobs > 1)
+            country_cands = self.block_queries(s1_c, country=country, n_jobs=n_jobs)
 
             for s1_id, cands in country_cands.items():
                 if s1_id in candidate_pairs:

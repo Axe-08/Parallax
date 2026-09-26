@@ -113,7 +113,9 @@ def generate_or_load_candidates(
     cache_path: Path,
     blocker_top_k: int = 35,
     blocker_min_sim: float = 0.15,
+    max_candidates_per_query: int = 35,
     checkpoint_mgr: CheckpointManager | None = None,
+    n_jobs: int = 1,
 ) -> dict[str, dict[str, float]]:
     """Generate or retrieve candidate pairs mapping s1_id -> candidate dict with sim scores."""
     if cache_path.is_file():
@@ -135,7 +137,8 @@ def generate_or_load_candidates(
         return candidates
 
     msg = (
-        f"  ⚡ Running multi-channel blocker (top_k={blocker_top_k}, min_sim={blocker_min_sim})..."
+        f"  ⚡ Running multi-channel blocker (top_k={blocker_top_k}, "
+        f"min_sim={blocker_min_sim}, max_cands={max_candidates_per_query}, n_jobs={n_jobs})..."
     )
     print(msg)
     t0 = time.time()
@@ -146,8 +149,12 @@ def generate_or_load_candidates(
         addr_min_sim=0.20,
         batch_size=2000,
         show_progress=True,
+        max_candidates_per_query=max_candidates_per_query,
+        n_jobs=n_jobs,
     )
-    candidates = blocker.generate_candidates(s1_wide, target_wide, checkpoint_mgr=checkpoint_mgr)
+    candidates = blocker.generate_candidates(
+        s1_wide, target_wide, checkpoint_mgr=checkpoint_mgr, n_jobs=n_jobs
+    )
 
     elapsed = time.time() - t0
     total_pairs = sum(len(c) for c in candidates.values())
@@ -180,6 +187,7 @@ def extract_or_load_features(
     target_wide: pd.DataFrame,
     gt_dict: Mapping[str, set[str]],
     cache_path: Path,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Extract or load pairwise similarity features."""
     if cache_path.is_file():
@@ -198,11 +206,19 @@ def extract_or_load_features(
         )
         del features_df
 
-    print("  ⚡ Extracting RapidFuzz and structural features across candidate pairs...")
+    print(
+        f"  ⚡ Extracting RapidFuzz and structural features "
+        f"across candidate pairs (n_jobs={n_jobs})..."
+    )
     t0 = time.time()
     extractor = PairwiseFeatureExtractor()
     features_df = extractor.extract_features_df(
-        candidates, s1_wide, target_wide, ground_truth=gt_dict, show_progress=True
+        candidates,
+        s1_wide,
+        target_wide,
+        ground_truth=gt_dict,
+        show_progress=True,
+        n_jobs=n_jobs,
     )
     elapsed = time.time() - t0
     print(f"  ✓ Feature extraction finished in {elapsed:.2f}s ({len(features_df):,} rows).")
@@ -648,6 +664,7 @@ def run_benchmark(
     skip_sweep: bool = False,
     sample_s1: int | None = None,
     n_jobs: int = 1,
+    max_candidates: int = 35,
 ) -> None:
     """Execute complete benchmark workflow with two-pass meta-resolution."""
     data_path = Path(data_dir)
@@ -742,9 +759,9 @@ def run_benchmark(
                 f"target records in {time.time() - t0:.2f}s.\n"
             )
         else:
-            s1_wide = widen_records_df(s1_df)
-            s2_wide = widen_records_df(s2_df)
-            s3_wide = widen_records_df(s3_df)
+            s1_wide = widen_records_df(s1_df, n_jobs=n_jobs)
+            s2_wide = widen_records_df(s2_df, n_jobs=n_jobs)
+            s3_wide = widen_records_df(s3_df, n_jobs=n_jobs)
             target_wide = pd.concat([s2_wide, s3_wide], ignore_index=True)
             checkpoint_mgr.save_dataframe(s1_tag, s1_wide)
             checkpoint_mgr.save_dataframe(target_tag, target_wide)
@@ -764,7 +781,12 @@ def run_benchmark(
             else "candidate_pairs_medium_200k.parquet"
         )
         candidates = generate_or_load_candidates(
-            s1_wide, target_wide, cand_cache, checkpoint_mgr=checkpoint_mgr
+            s1_wide,
+            target_wide,
+            cand_cache,
+            max_candidates_per_query=max_candidates,
+            checkpoint_mgr=checkpoint_mgr,
+            n_jobs=n_jobs,
         )
 
         blocking_report = evaluate_blocking_candidates(gt_dict, candidates, len(target_wide))
@@ -784,7 +806,7 @@ def run_benchmark(
             f"features_sample_{sample_s1}.parquet" if sample_s1 else "features_medium_200k.parquet"
         )
         features_df = extract_or_load_features(
-            candidates, s1_wide, target_wide, gt_dict, feat_cache
+            candidates, s1_wide, target_wide, gt_dict, feat_cache, n_jobs=n_jobs
         )
 
     exec_logger.check_memory_threshold()
@@ -915,7 +937,13 @@ def main() -> None:
         "--n-jobs",
         type=int,
         default=1,
-        help="Number of concurrent processes for 5-fold cross-validation",
+        help="Number of concurrent worker processes for end-to-end pipeline stages",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=35,
+        help="Maximum candidate matches preserved per query in blocking (default: 35)",
     )
     args = parser.parse_args()
 
@@ -935,6 +963,7 @@ def main() -> None:
         skip_sweep=args.skip_sweep,
         sample_s1=args.sample_s1,
         n_jobs=args.n_jobs,
+        max_candidates=args.max_candidates,
     )
 
 

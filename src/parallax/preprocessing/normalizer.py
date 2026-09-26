@@ -10,9 +10,12 @@ Non-destructive data widening and multilingual text canonicalization:
 
 from __future__ import annotations
 
+import multiprocessing
 import re
 import unicodedata
+from concurrent.futures import ProcessPoolExecutor
 
+import numpy as np
 import pandas as pd
 
 from parallax.preprocessing.transliteration import transliterate_brahmic_to_latin
@@ -292,11 +295,8 @@ def clean_transliterated_text(text: str | None) -> str:
     return clean_soft_name(translit)
 
 
-def widen_records_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add derived, parallel representation columns to a business records DataFrame
-    without modifying the original raw columns.
-    """
+def _widen_records_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """Widen a single chunk of business records."""
     enriched = df.copy()
     enriched["soft_name"] = enriched["business_name"].apply(clean_soft_name)
     enriched["token_sorted_name"] = enriched["soft_name"].apply(get_token_sorted_name)
@@ -310,3 +310,38 @@ def widen_records_df(df: pd.DataFrame) -> pd.DataFrame:
     enriched["city_token"] = enriched["business_address"].apply(extract_city_token)
     enriched["is_addr_null"] = enriched["business_address"].isna().astype(int)
     return enriched
+
+
+def widen_records_df(df: pd.DataFrame, n_jobs: int = 1) -> pd.DataFrame:
+    """
+    Add derived, parallel representation columns to a business records DataFrame
+    without modifying the original raw columns.
+    When n_jobs > 1 and len(df) >= 2000, distributes chunks across worker processes.
+    """
+    if len(df) == 0:
+        return df.copy()
+
+    if n_jobs <= 1 or len(df) < 2000:
+        return _widen_records_chunk(df)
+
+    chunk_size = int(np.ceil(len(df) / n_jobs))
+    valid_chunks = [
+        df.iloc[i : i + chunk_size].copy()
+        for i in range(0, len(df), chunk_size)
+    ]
+    if len(valid_chunks) <= 1:
+        return _widen_records_chunk(df)
+
+    ctx = (
+        multiprocessing.get_context("fork")
+        if "fork" in multiprocessing.get_all_start_methods()
+        else None
+    )
+    with ProcessPoolExecutor(
+        max_workers=min(n_jobs, len(valid_chunks)),
+        mp_context=ctx,
+    ) as executor:
+        results = list(executor.map(_widen_records_chunk, valid_chunks))
+
+    return pd.concat(results, ignore_index=True)
+
