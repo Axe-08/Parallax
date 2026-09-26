@@ -3,8 +3,8 @@ Parallax Multi-Channel Sparse & Phonetic Blocker (v3)
 =====================================================
 High-recall, memory-efficient candidate generator:
 - Dynamic country-partitioned indexing (open-set: US, India, France)
-- Channel A: Character 3-Gram TF-IDF over business names
-- Channel B: Character 3-Gram TF-IDF over addresses
+- Channel A: Word (1, 2) TF-IDF over business names with single-char token pattern
+- Channel B: Word (1, 2) TF-IDF over addresses with single-char token pattern
 - Channel C: Building Number Match with Leading Character Prefix
 - Channel D: Postal / PIN Code Hash-Join with length ratio filtering
 - Channel E: Phonetic First-Token Match using Metaphone
@@ -108,7 +108,7 @@ class DualChannelTFIDFBlocker:
         self.tgt_ids = tgt_c["entity_id"].astype(str).tolist()
         n_targets = len(tgt_c)
 
-        # 1. Channel A: Name Character 3-Gram TF-IDF with Stop-Gram Pruning
+        # 1. Channel A: Name Word (1, 2) TF-IDF with High-Frequency Pruning & Single-Char Support
         tgt_names = build_blocking_texts(tgt_c, "soft_name", "business_name", "translit_name")
         self.tgt_names = tgt_names
 
@@ -116,8 +116,9 @@ class DualChannelTFIDFBlocker:
         max_df = 0.05 if n_targets > 500 else 1.0
 
         self.vec_name = TfidfVectorizer(
-            analyzer="char",
-            ngram_range=(3, 3),
+            analyzer="word",
+            ngram_range=(1, 2),
+            token_pattern=r"(?u)\b\w+\b",
             min_df=min_df,
             max_df=max_df,
             sublinear_tf=True,
@@ -128,7 +129,7 @@ class DualChannelTFIDFBlocker:
         del tgt_mat_name
         gc.collect()
 
-        # 2. Channel B: Address Character 3-Gram TF-IDF with Stop-Gram Pruning
+        # 2. Channel B: Address Word (1, 2) TF-IDF with High-Frequency Pruning & Single-Char Support
         tgt_addrs = build_blocking_texts(
             tgt_c, "clean_address", "business_address", "translit_address"
         )
@@ -138,6 +139,7 @@ class DualChannelTFIDFBlocker:
             self.vec_addr = TfidfVectorizer(
                 analyzer="word",
                 ngram_range=(1, 2),
+                token_pattern=r"(?u)\b\w+\b",
                 min_df=min_df_addr,
                 max_df=max_df_addr,
                 sublinear_tf=True,
@@ -280,7 +282,11 @@ class DualChannelTFIDFBlocker:
             del b_mat_name, b_sims_name
 
             # --- Channel B: Address TF-IDF Dot Product ---
-            if self.vec_addr is not None and self.tgt_addr_mat is not None:
+            if (
+                self.vec_addr is not None
+                and self.tgt_addr_mat is not None
+                and any(a.strip() for a in b_s1_addrs)
+            ):
                 b_mat_addr = self.vec_addr.transform(b_s1_addrs).astype(np.float32)
                 b_sims_addr = b_mat_addr.dot(self.tgt_addr_mat)
 
