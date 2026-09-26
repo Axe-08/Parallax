@@ -36,9 +36,9 @@ from build_pairwise_features import BASELINE_28_FEATURES
 
 EXPERIMENT_FEATURE_SETS: dict[str, list[str]] = {
     "E0": BASELINE_28_FEATURES,
-    "E1": BASELINE_28_FEATURES + ["indicxlit_name_similarity"],
+    "E1": BASELINE_28_FEATURES + ["indicxlit_name_similarity", "has_indicxlit_name"],
     "E2": BASELINE_28_FEATURES + ["qwen_name_cosine"],
-    "E3": BASELINE_28_FEATURES + ["indicxlit_name_similarity", "qwen_name_cosine"],
+    "E3": BASELINE_28_FEATURES + ["indicxlit_name_similarity", "has_indicxlit_name", "qwen_name_cosine"],
 }
 
 
@@ -179,7 +179,8 @@ def run_experiment_arm(
     print(f"========================================================")
 
     # Merge fold assignments into features dataframe
-    s1_to_fold = dict(zip(cv_folds_df["s1_id"].astype(str), cv_folds_df["fold"], strict=False))
+    entity_col = "entity_id" if "entity_id" in cv_folds_df.columns else "s1_id"
+    s1_to_fold = dict(zip(cv_folds_df[entity_col].astype(str), cv_folds_df["fold"], strict=False))
     s1_fold_arr = np.array([s1_to_fold.get(str(s), -1) for s in augmented_df["s1_id"]], dtype=np.int32)
 
     fold_results: list[FoldResult] = []
@@ -192,7 +193,7 @@ def run_experiment_arm(
         train_sub = augmented_df[train_mask]
         val_sub = augmented_df[val_mask].copy()
 
-        val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k]["s1_id"].astype(str))
+        val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k][entity_col].astype(str))
         val_gt = {s1: ground_truth.get(s1, set()) for s1 in val_s1_set}
 
         res, _, fold_preds = train_and_eval_fold(
@@ -226,8 +227,12 @@ def run_experiment_arm(
     false_merges = full_report.total_predicted_pairs - total_tps
 
     # Cross-script true pair recovery (candidates with Indic characters)
-    # Check predictions for cross-script pairs
-    cs_mask = (augmented_df["target"] == 1) & (augmented_df["indicxlit_name_similarity"] != augmented_df["soft_name_ratio"])
+    # Check predictions for cross-script pairs using the boolean indicator
+    has_indic_col = "has_indicxlit_name" if "has_indicxlit_name" in augmented_df.columns else None
+    if has_indic_col:
+        cs_mask = (augmented_df["target"] == 1) & (augmented_df[has_indic_col] == 1.0)
+    else:
+        cs_mask = (augmented_df["target"] == 1) & (augmented_df["indicxlit_name_similarity"].notna())
     cs_pairs = augmented_df[cs_mask][["s1_id", "cand_id"]]
     cs_recovered = 0
     for s1, cand in zip(cs_pairs["s1_id"], cs_pairs["cand_id"], strict=False):
@@ -394,6 +399,25 @@ def main() -> None:
 
     print(f"Loading ground truth from: {args.ground_truth}")
     gt_dict = load_ground_truth_dict(args.ground_truth)
+
+    # Schema normalization and strict fold verification
+    entity_col = "entity_id" if "entity_id" in cv_folds_df.columns else "s1_id"
+    present_s1 = set(augmented_df["s1_id"].astype(str).unique())
+    cv_folds_df = cv_folds_df[cv_folds_df[entity_col].astype(str).isin(present_s1)].reset_index(drop=True)
+    gt_dict = {k: v for k, v in gt_dict.items() if k in present_s1}
+
+    # Strict fold verification assertions
+    assert len(cv_folds_df) == len(present_s1), (
+        f"Fold count mismatch: {len(cv_folds_df)} fold assignments vs {len(present_s1)} entities in features!"
+    )
+    assert cv_folds_df[entity_col].nunique() == len(cv_folds_df), "Duplicate entity IDs found in fold assignments!"
+    folds = sorted(cv_folds_df["fold"].unique())
+    assert len(folds) == 5, f"Expected 5 CV folds, found {len(folds)}: {folds}"
+    expected_fold_size = len(cv_folds_df) // 5
+    for f in folds:
+        cnt = (cv_folds_df["fold"] == f).sum()
+        assert cnt == expected_fold_size, f"Fold {f} has {cnt} entities, expected {expected_fold_size}!"
+    print(f"Verified CV folds: {len(cv_folds_df):,} entities across 5 folds ({expected_fold_size:,} entities/fold).")
 
     results: list[ExperimentResult] = []
     e0_preds: dict[str, set[str]] | None = None

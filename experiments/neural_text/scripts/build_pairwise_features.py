@@ -78,34 +78,35 @@ def load_qwen_embeddings(cache_path: Path) -> tuple[dict[str, int], np.ndarray]:
     return id_to_idx, embeddings
 
 
-def compute_indicxlit_name_similarity(
+def compute_indicxlit_features(
     s1_ids: np.ndarray,
     cand_ids: np.ndarray,
     s1_soft_names: dict[str, str],
-    cand_soft_names: dict[str, str],
     indicxlit_cache: dict[str, str],
-    baseline_soft_ratio: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute IndicXlit phonetic name similarity for each candidate pair.
-    If candidate is Indic and transliteration exists, computes fuzz.ratio(s1_soft, cand_indicxlit).
-    If candidate is already Latin, smoothly falls back to existing soft_name_ratio.
+    Compute IndicXlit phonetic name similarity and applicability indicator.
+    - indicxlit_name_similarity: fuzz.ratio(s1_soft, cand_translit) / 100.0 for Indic candidates, np.nan otherwise.
+    - has_indicxlit_name: 1.0 if candidate has an Indic transliteration in cache, 0.0 otherwise.
+    LightGBM natively branches on np.nan missing values without silently duplicating lexical features.
     """
     total = len(s1_ids)
-    sims = np.empty(total, dtype=np.float32)
+    sims = np.full(total, np.nan, dtype=np.float32)
+    has_indic = np.zeros(total, dtype=np.float32)
 
-    for i in tqdm(range(total), desc="Building IndicXlit Sim"):
+    if not indicxlit_cache:
+        return sims, has_indic
+
+    for i in tqdm(range(total), desc="Building IndicXlit Features"):
         c_id = str(cand_ids[i])
         if c_id in indicxlit_cache and indicxlit_cache[c_id]:
             s_id = str(s1_ids[i])
             s1_name = s1_soft_names.get(s_id, "")
             cand_translit = indicxlit_cache[c_id]
             sims[i] = fuzz.ratio(s1_name, cand_translit) / 100.0
-        else:
-            # Same-script fallback to existing normalized soft ratio
-            sims[i] = baseline_soft_ratio[i]
+            has_indic[i] = 1.0
 
-    return sims
+    return sims, has_indic
 
 
 def compute_qwen_name_cosine(
@@ -113,34 +114,47 @@ def compute_qwen_name_cosine(
     cand_ids: np.ndarray,
     id_to_idx: dict[str, int],
     embeddings: np.ndarray,
+    chunk_size: int = 250_000,
 ) -> np.ndarray:
     """
     Compute pairwise cosine similarity between S1 and candidate name embeddings.
-    Embeddings are assumed to be unit L2-normalized, so cosine_sim = dot_product.
+    Embeddings are unit L2-normalized, so cosine_sim = dot_product.
+    Processes in chunks using np.einsum to guarantee bounded transient memory.
+    Enforces strict completeness check on entity IDs (no silent 0.0 imputation).
     """
     total = len(s1_ids)
     cosines = np.zeros(total, dtype=np.float32)
 
     if len(id_to_idx) == 0 or len(embeddings) == 0:
-        print("Warning: Embedding cache is empty. Filling qwen_name_cosine with 0.0.")
-        return cosines
+        raise ValueError("Critical Error: Qwen embedding cache is empty! Cannot evaluate neural cosine.")
 
-    # Vectorized batch dot product
-    s1_indices = np.array([id_to_idx.get(str(s), -1) for s in s1_ids], dtype=np.int32)
-    cand_indices = np.array([id_to_idx.get(str(c), -1) for c in cand_ids], dtype=np.int32)
+    # Strict completeness check: verify all unique entities in pairs are present in cache
+    unique_s1 = set(map(str, s1_ids))
+    unique_cand = set(map(str, cand_ids))
+    all_needed = unique_s1 | unique_cand
+    missing_ids = all_needed - set(id_to_idx.keys())
+    if missing_ids:
+        missing_sample = list(missing_ids)[:5]
+        raise AssertionError(
+            f"Embedding Cache Incomplete: {len(missing_ids):,} entities from candidate pairs "
+            f"missing from Qwen cache (e.g. {missing_sample}). Re-run generate_qwen_cache.py."
+        )
 
-    valid_mask = (s1_indices >= 0) & (cand_indices >= 0)
-    print(f"Pairs with valid embeddings on both sides: {valid_mask.sum():,} / {total:,} ({valid_mask.mean()*100:.2f}%)")
+    # Process in sequential chunks to bound transient memory allocations
+    for start in tqdm(range(0, total, chunk_size), desc="Computing Qwen Cosine (Chunks)"):
+        end = min(start + chunk_size, total)
+        chunk_s1 = s1_ids[start:end]
+        chunk_cand = cand_ids[start:end]
 
-    valid_s1_idx = s1_indices[valid_mask]
-    valid_cand_idx = cand_indices[valid_mask]
+        s1_indices = np.array([id_to_idx[str(s)] for s in chunk_s1], dtype=np.int32)
+        cand_indices = np.array([id_to_idx[str(c)] for c in chunk_cand], dtype=np.int32)
 
-    s1_vecs = embeddings[valid_s1_idx]
-    cand_vecs = embeddings[valid_cand_idx]
+        v1 = embeddings[s1_indices].astype(np.float32)
+        v2 = embeddings[cand_indices].astype(np.float32)
 
-    # Element-wise product and sum across embedding dimension
-    dots = np.sum(s1_vecs * cand_vecs, axis=1)
-    cosines[valid_mask] = np.clip(dots, -1.0, 1.0)
+        # In-place row-wise dot product without temporary 2D product arrays
+        dots = np.einsum("ij,ij->i", v1, v2)
+        cosines[start:end] = np.clip(dots, -1.0, 1.0)
 
     return cosines
 
@@ -248,30 +262,30 @@ def build_augmented_features(
         strict=False,
     ))
 
-    # 1. IndicXlit Name Similarity
+    # 1. IndicXlit Features
     print(f"Loading IndicXlit cache from: {indicxlit_cache_path}")
     indicxlit_cache = load_indicxlit_cache(indicxlit_cache_path)
-    base_soft_ratio = base_df["soft_name_ratio"].to_numpy(dtype=np.float32)
-    indicxlit_sim = compute_indicxlit_name_similarity(
-        s1_ids, cand_ids, s1_soft_names, cand_soft_names, indicxlit_cache, base_soft_ratio
+    indicxlit_sim, has_indic = compute_indicxlit_features(
+        s1_ids, cand_ids, s1_soft_names, indicxlit_cache
     )
 
     # 2. Qwen Name Cosine
     print(f"Loading Qwen embedding cache from: {qwen_cache_path}")
     id_to_idx, embeddings = load_qwen_embeddings(qwen_cache_path)
-    qwen_cosine = compute_qwen_name_cosine(s1_ids, cand_ids, id_to_idx, embeddings)
+    qwen_cosine = compute_qwen_name_cosine(s1_ids, cand_ids, id_to_idx, embeddings, chunk_size=chunk_size)
 
     # Create augmented dataframe
     augmented_df = base_df.copy()
     augmented_df["indicxlit_name_similarity"] = indicxlit_sim
+    augmented_df["has_indicxlit_name"] = has_indic
     augmented_df["qwen_name_cosine"] = qwen_cosine
 
     # Rigorous Integrity Assertions
     assert len(augmented_df) == total_pairs, "Row count changed during feature construction!"
     assert (augmented_df["s1_id"].to_numpy() == s1_ids).all(), "s1_id alignment broken!"
     assert (augmented_df["cand_id"].to_numpy() == cand_ids).all(), "cand_id alignment broken!"
-    assert not augmented_df["indicxlit_name_similarity"].isna().any(), "NaN found in indicxlit_name_similarity!"
     assert not augmented_df["qwen_name_cosine"].isna().any(), "NaN found in qwen_name_cosine!"
+    assert augmented_df["has_indicxlit_name"].isin([0.0, 1.0]).all(), "Invalid values in has_indicxlit_name!"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     augmented_df.to_parquet(output_path, index=False)
@@ -290,6 +304,7 @@ def main() -> None:
     parser.add_argument("--indicxlit-cache", type=Path, default=None, help="Path to IndicXlit parquet cache")
     parser.add_argument("--qwen-cache", type=Path, default=None, help="Path to Qwen .npz cache")
     parser.add_argument("--output-path", type=Path, default=None, help="Path for output augmented features parquet")
+    parser.add_argument("--chunk-size", type=int, default=250_000, help="Chunk size for batch dot product")
     args = parser.parse_args()
 
     if args.scale == "5000":
@@ -322,6 +337,7 @@ def main() -> None:
         output_path=out_path,
         candidates_path=cand_path,
         s1_limit=s1_limit,
+        chunk_size=args.chunk_size,
     )
 
 

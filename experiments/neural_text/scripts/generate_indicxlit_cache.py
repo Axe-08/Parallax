@@ -237,6 +237,7 @@ def main() -> None:
     parser.add_argument("--beam-width", type=int, default=4, help="Beam width for beam search")
     parser.add_argument("--rescore", action="store_true", help="Enable dictionary rescoring")
     parser.add_argument("--model-dir", type=str, default=None, help="Directory containing offline model weights")
+    parser.add_argument("--candidates-path", type=Path, default=None, help="Optional candidate pairs parquet to restrict candidate pool")
     parser.add_argument("--no-resume", action="store_true", help="Overwrite existing cache instead of resuming")
     parser.add_argument("--dry-run", action="store_true", help="Inspect counts only without loading model")
     args = parser.parse_args()
@@ -246,12 +247,14 @@ def main() -> None:
         s1_path = args.s1_path or Path("data/medium_split_200k/train_source1.tsv")
         s2_path = args.s2_path or Path("data/medium_split_200k/train_source2.tsv")
         s3_path = args.s3_path or Path("data/medium_split_200k/train_source3.tsv")
+        cands_path = args.candidates_path or Path("baseline_artifacts/candidate_pairs_sample.parquet")
         out_path = args.output_path or Path("experiments/neural_text/caches/indicxlit_translit_cache_5k.parquet")
         s1_limit = 5000
     else:
         s1_path = args.s1_path or Path("data/medium_split_200k/train_source1.tsv")
         s2_path = args.s2_path or Path("data/medium_split_200k/train_source2.tsv")
         s3_path = args.s3_path or Path("data/medium_split_200k/train_source3.tsv")
+        cands_path = args.candidates_path or Path("data/full_dataset/candidate_pairs.parquet")
         out_path = args.output_path or Path("experiments/neural_text/caches/indicxlit_translit_cache_200k.parquet")
         s1_limit = None
 
@@ -259,9 +262,20 @@ def main() -> None:
     s1_df = pd.read_csv(s1_path, sep="\t", nrows=s1_limit)
     s2_df = pd.read_csv(s2_path, sep="\t")
     s3_df = pd.read_csv(s3_path, sep="\t")
+    all_targets = pd.concat([s2_df, s3_df], ignore_index=True)
+
+    if cands_path.exists():
+        print(f"Filtering targets to entities appearing in {cands_path}...")
+        cand_pairs = pd.read_parquet(cands_path, columns=["s1_id", "cand_id"])
+        cand_ids = set(cand_pairs["cand_id"].astype(str).unique())
+        filtered_targets = all_targets[all_targets["entity_id"].astype(str).isin(cand_ids)]
+        sources_to_process = [s1_df, filtered_targets]
+    else:
+        print("Candidate parquet not found; scanning all records in sources.")
+        sources_to_process = [s1_df, all_targets]
 
     run_cache_generation(
-        sources=[s1_df, s2_df, s3_df],
+        sources=sources_to_process,
         output_path=out_path,
         beam_width=args.beam_width,
         rescore=args.rescore,
