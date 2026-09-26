@@ -53,8 +53,9 @@ def run_streaming_test_inference(
     models_dir: Path,
     output_tsv_path: Path,
     chunk_size: int = 20_000,
-    blocker_top_k: int = 30,
+    blocker_top_k: int = 15,
     batch_size: int = 2_000,
+    max_candidates_per_query: int = 15,
 ) -> Path:
     """
     Execute streaming inference on full test dataset:
@@ -151,11 +152,12 @@ def run_streaming_test_inference(
 
         blocker = DualChannelTFIDFBlocker(
             name_top_k=blocker_top_k,
-            addr_top_k=min(20, blocker_top_k),
+            addr_top_k=min(10, blocker_top_k),
             name_min_sim=0.15,
             addr_min_sim=0.20,
             batch_size=batch_size,
             show_progress=False,
+            max_candidates_per_query=max_candidates_per_query,
         )
         blocker.index_country_targets(tgt_c, country=country)
         print(f"  ✓ Indexed TF-IDF target matrices in {time.time() - t0_wc:.2f}s.")
@@ -182,14 +184,24 @@ def run_streaming_test_inference(
         )
 
         for start_idx in pbar:
+            t_chunk_start = time.time()
             end_idx = min(start_idx + chunk_size, len(s1_raw_c))
             s1_raw_chunk = s1_raw_c.iloc[start_idx:end_idx].reset_index(drop=True)
+
+            t0 = time.time()
             s1_chunk = widen_records_df(s1_raw_chunk)
             del s1_raw_chunk
             chunk_s1_ids = s1_chunk["entity_id"].astype(str).tolist()
 
             # 1. Candidate Generation against pre-indexed targets
-            candidates = blocker.block_queries(s1_chunk, country=country, batch_size=batch_size)
+            t0 = time.time()
+            candidates = blocker.block_queries(
+                s1_chunk,
+                country=country,
+                batch_size=batch_size,
+                max_candidates_per_query=max_candidates_per_query,
+            )
+            t_block = time.time() - t0
             total_pairs = sum(len(v) for v in candidates.values())
 
             if total_pairs == 0:
@@ -199,6 +211,7 @@ def run_streaming_test_inference(
                 continue
 
             # 2. Pairwise Feature Extraction
+            t0 = time.time()
             features_df = extractor.extract_features_df(
                 candidates,
                 s1_chunk,
@@ -206,7 +219,10 @@ def run_streaming_test_inference(
                 show_progress=False,
                 target_lookup=country_target_lookup,
             )
+            t_extr = time.time() - t0
 
+            # 3. Model Scoring & Gating
+            t0 = time.time()
             if len(features_df) > 0:
                 # 3. Pass 1 Prediction
                 features_df["prob"] = matcher_p1.predict_proba(features_df)
@@ -224,6 +240,17 @@ def run_streaming_test_inference(
                 for s1_id, match_set in chunk_preds.items():
                     if match_set:
                         all_predictions[s1_id] = match_set
+            t_pred = time.time() - t0
+
+            t_chunk_elapsed = time.time() - t_chunk_start
+            q_per_sec = len(s1_chunk) / t_chunk_elapsed if t_chunk_elapsed > 0 else 0.0
+            pbar.set_postfix(
+                pairs=f"{total_pairs:,}",
+                rate=f"{q_per_sec:.1f}q/s",
+                blk=f"{t_block:.1f}s",
+                ext=f"{t_extr:.1f}s",
+                pred=f"{t_pred:.1f}s",
+            )
 
             del candidates, features_df, s1_chunk
             gc.collect()

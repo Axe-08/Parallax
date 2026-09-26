@@ -66,12 +66,13 @@ class DualChannelTFIDFBlocker:
 
     def __init__(
         self,
-        name_top_k: int = 35,
-        addr_top_k: int = 25,
+        name_top_k: int = 15,
+        addr_top_k: int = 10,
         name_min_sim: float = 0.15,
         addr_min_sim: float = 0.20,
         batch_size: int = 1000,
         show_progress: bool = True,
+        max_candidates_per_query: int = 15,
     ) -> None:
         self.name_top_k = name_top_k
         self.addr_top_k = addr_top_k
@@ -79,6 +80,7 @@ class DualChannelTFIDFBlocker:
         self.addr_min_sim = addr_min_sim
         self.batch_size = batch_size
         self.show_progress = show_progress
+        self.max_candidates_per_query = max_candidates_per_query
 
         # Stateful index storage for current country partition
         self.indexed_country: str | None = None
@@ -208,6 +210,7 @@ class DualChannelTFIDFBlocker:
         s1_c: pd.DataFrame,
         country: str = "",
         batch_size: int | None = None,
+        max_candidates_per_query: int | None = None,
     ) -> dict[str, dict[str, float]]:
         """
         Generate candidate pairs for queries against pre-indexed targets.
@@ -406,6 +409,19 @@ class DualChannelTFIDFBlocker:
                         if 0 < len(matches) <= 20:
                             for tgt_idx in matches:
                                 _add_cand(s1_id, self.tgt_ids[tgt_idx], 0.40)
+
+        max_cands = (
+            max_candidates_per_query
+            if max_candidates_per_query is not None
+            else self.max_candidates_per_query
+        )
+        if max_cands is not None and max_cands > 0:
+            for s1_id, query_cands in candidate_pairs.items():
+                if len(query_cands) > max_cands:
+                    top_items = sorted(query_cands.items(), key=lambda item: item[1], reverse=True)[
+                        :max_cands
+                    ]
+                    candidate_pairs[s1_id] = dict(top_items)
 
         return candidate_pairs
 

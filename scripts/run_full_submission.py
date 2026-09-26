@@ -40,9 +40,11 @@ try:
             f"| Disk: {disk.free / (1024**3):.1f} GB free]"
         )
 except Exception:
+
     def get_telemetry_str() -> str:
         disk = shutil.disk_usage(".")
         return f"[Disk: {disk.free / (1024**3):.1f} GB free]"
+
 
 from parallax.s3_utils import (
     download_s3_file,
@@ -101,9 +103,13 @@ def main() -> None:
         import psutil
 
         mem = psutil.virtual_memory()
-        print(f"  🖥️ Host Environment:    {platform.platform()} | Python {platform.python_version()}")
+        print(
+            f"  🖥️ Host Environment:    {platform.platform()} | Python {platform.python_version()}"
+        )
         print(f"  ⚡ Available Cores:     {multiprocessing.cpu_count()} vCPUs")
-        print(f"  🧠 Host Memory (RAM):   {mem.total / (1024**3):.1f} GB total ({mem.available / (1024**3):.1f} GB free)")
+        print(
+            f"  🧠 Host Memory (RAM):   {mem.total / (1024**3):.1f} GB total ({mem.available / (1024**3):.1f} GB free)"
+        )
     except Exception:
         pass
 
@@ -116,7 +122,9 @@ def main() -> None:
     s3_client = get_s3_client()
     try:
         s3_client.head_bucket(Bucket=bucket)
-        print(f"  ✓ Verified active connectivity to s3://{bucket} ({time.time() - t_s3_ping:.2f}s latency)")
+        print(
+            f"  ✓ Verified active connectivity to s3://{bucket} ({time.time() - t_s3_ping:.2f}s latency)"
+        )
     except Exception as exc:
         raise RuntimeError(f"❌ Failed to connect to S3 bucket {bucket}: {exc}") from exc
 
@@ -180,7 +188,9 @@ def main() -> None:
 
     # Immediately preserve trained models & metadata to S3 for analysis
     try:
-        upload_s3_file(meta_path, "models/production_metadata.json", bucket=bucket, client=s3_client)
+        upload_s3_file(
+            meta_path, "models/production_metadata.json", bucket=bucket, client=s3_client
+        )
         upload_s3_file(p1_path, "models/production_pass1.txt", bucket=bucket, client=s3_client)
         upload_s3_file(p2_path, "models/production_pass2.txt", bucket=bucket, client=s3_client)
         print("  ✓ Synchronized trained models and calibration metadata to S3.")

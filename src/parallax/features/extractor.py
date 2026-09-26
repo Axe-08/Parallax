@@ -234,17 +234,11 @@ class PairwiseFeatureExtractor:
             else addrs
         )
         nums = df["numbers"].tolist() if "numbers" in df else [set()] * len(df)
-        nulls = (
-            df["is_addr_null"].astype(int).tolist() if "is_addr_null" in df else [0] * len(df)
-        )
-        primary_nums = (
-            df["primary_number"].tolist() if "primary_number" in df else [None] * len(df)
-        )
+        nulls = df["is_addr_null"].astype(int).tolist() if "is_addr_null" in df else [0] * len(df)
+        primary_nums = df["primary_number"].tolist() if "primary_number" in df else [None] * len(df)
         postal_codes = df["postal_code"].tolist() if "postal_code" in df else [None] * len(df)
         canon_addrs = (
-            df["canon_address"].fillna("").astype(str).tolist()
-            if "canon_address" in df
-            else addrs
+            df["canon_address"].fillna("").astype(str).tolist() if "canon_address" in df else addrs
         )
         if "city_token" in df:
             city_tokens = df["city_token"].tolist()
@@ -484,60 +478,61 @@ class PairwiseFeatureExtractor:
                 ) = cand_row
 
                 # --- 1-5: Lexical Name Features ---
-                raw_ratio_arr[idx] = (
-                    max(
-                        fuzz.ratio(s1_raw_name, cand_raw_name),
-                        fuzz.ratio(s1_raw_name, cand_translit_name),
-                    )
-                    / 100.0
+                has_distinct_translit_name = bool(
+                    cand_translit_name and cand_translit_name != cand_soft_name
                 )
-                soft_ratio_arr[idx] = (
-                    max(
-                        fuzz.ratio(s1_soft_name, cand_soft_name),
-                        fuzz.ratio(s1_soft_name, cand_translit_name),
-                    )
-                    / 100.0
+                has_distinct_translit_raw = bool(
+                    cand_translit_name and cand_translit_name != cand_raw_name
                 )
-                token_sort_arr[idx] = (
-                    max(
-                        fuzz.token_sort_ratio(s1_soft_name, cand_soft_name),
-                        fuzz.token_sort_ratio(s1_soft_name, cand_translit_name),
-                    )
-                    / 100.0
+
+                raw_rat = fuzz.ratio(s1_raw_name, cand_raw_name)
+                if has_distinct_translit_raw:
+                    raw_rat = max(raw_rat, fuzz.ratio(s1_raw_name, cand_translit_name))
+                raw_ratio_arr[idx] = raw_rat / 100.0
+
+                base_soft_rat = fuzz.ratio(s1_soft_name, cand_soft_name)
+                soft_rat = (
+                    max(base_soft_rat, fuzz.ratio(s1_soft_name, cand_translit_name))
+                    if has_distinct_translit_name
+                    else base_soft_rat
                 )
-                token_set_arr[idx] = (
-                    max(
-                        fuzz.token_set_ratio(s1_soft_name, cand_soft_name),
-                        fuzz.token_set_ratio(s1_soft_name, cand_translit_name),
+                soft_ratio_arr[idx] = soft_rat / 100.0
+
+                tok_sort = fuzz.token_sort_ratio(s1_soft_name, cand_soft_name)
+                if has_distinct_translit_name:
+                    tok_sort = max(
+                        tok_sort, fuzz.token_sort_ratio(s1_soft_name, cand_translit_name)
                     )
-                    / 100.0
-                )
-                partial_arr[idx] = (
-                    max(
-                        fuzz.partial_ratio(s1_soft_name, cand_soft_name),
-                        fuzz.partial_ratio(s1_soft_name, cand_translit_name),
-                    )
-                    / 100.0
-                )
+                token_sort_arr[idx] = tok_sort / 100.0
+
+                tok_set = fuzz.token_set_ratio(s1_soft_name, cand_soft_name)
+                if has_distinct_translit_name:
+                    tok_set = max(tok_set, fuzz.token_set_ratio(s1_soft_name, cand_translit_name))
+                token_set_arr[idx] = tok_set / 100.0
+
+                part_rat = fuzz.partial_ratio(s1_soft_name, cand_soft_name)
+                if has_distinct_translit_name:
+                    part_rat = max(part_rat, fuzz.partial_ratio(s1_soft_name, cand_translit_name))
+                partial_arr[idx] = part_rat / 100.0
 
                 # --- 6-7: Baseline Address Alignment ---
                 both_present = 1 if (not s1_null and not cand_null and s1_addr and cand_addr) else 0
                 both_present_arr[idx] = both_present
                 if both_present:
-                    addr_token_set_arr[idx] = (
-                        max(
-                            fuzz.token_set_ratio(s1_addr, cand_addr),
-                            fuzz.token_set_ratio(s1_addr, cand_translit_addr),
-                        )
-                        / 100.0
+                    has_distinct_translit_addr = bool(
+                        cand_translit_addr and cand_translit_addr != cand_addr
                     )
-                    addr_ratio_arr[idx] = (
-                        max(
-                            fuzz.ratio(s1_addr, cand_addr),
-                            fuzz.ratio(s1_addr, cand_translit_addr),
+                    a_tok_set = fuzz.token_set_ratio(s1_addr, cand_addr)
+                    if has_distinct_translit_addr:
+                        a_tok_set = max(
+                            a_tok_set, fuzz.token_set_ratio(s1_addr, cand_translit_addr)
                         )
-                        / 100.0
-                    )
+                    addr_token_set_arr[idx] = a_tok_set / 100.0
+
+                    a_rat = fuzz.ratio(s1_addr, cand_addr)
+                    if has_distinct_translit_addr:
+                        a_rat = max(a_rat, fuzz.ratio(s1_addr, cand_translit_addr))
+                    addr_ratio_arr[idx] = a_rat / 100.0
                 else:
                     addr_token_set_arr[idx] = 0.0
                     addr_ratio_arr[idx] = 0.0
@@ -618,18 +613,15 @@ class PairwiseFeatureExtractor:
                     postal_missing_arr[idx] = 1.0
 
                 # --- 22-23: Jaro-Winkler Similarities ---
-                jaro_winkler_soft_arr[idx] = float(
-                    max(
-                        JaroWinkler.similarity(s1_soft_name, cand_soft_name),
-                        JaroWinkler.similarity(s1_soft_name, cand_translit_name),
-                    )
-                )
-                jaro_winkler_raw_arr[idx] = float(
-                    max(
-                        JaroWinkler.similarity(s1_raw_name, cand_raw_name),
-                        JaroWinkler.similarity(s1_raw_name, cand_translit_name),
-                    )
-                )
+                jw_soft = JaroWinkler.similarity(s1_soft_name, cand_soft_name)
+                if has_distinct_translit_name:
+                    jw_soft = max(jw_soft, JaroWinkler.similarity(s1_soft_name, cand_translit_name))
+                jaro_winkler_soft_arr[idx] = float(jw_soft)
+
+                jw_raw = JaroWinkler.similarity(s1_raw_name, cand_raw_name)
+                if has_distinct_translit_raw:
+                    jw_raw = max(jw_raw, JaroWinkler.similarity(s1_raw_name, cand_translit_name))
+                jaro_winkler_raw_arr[idx] = float(jw_raw)
 
                 # --- 24-26: Name Token Jaccard, Overlap & First Token Match ---
                 if s1_name_toks and cand_name_toks:
@@ -698,12 +690,15 @@ class PairwiseFeatureExtractor:
                 token_set_null_cand_arr[idx] = t_set_ratio * c_null_f
 
                 # --- 36-38: Transliteration & Cross-Script Signals ---
-                raw_soft_ratio = fuzz.ratio(s1_soft_name, cand_soft_name) / 100.0
+                raw_soft_ratio = base_soft_rat / 100.0
                 translit_boost_name_arr[idx] = max(0.0, s_name_ratio - raw_soft_ratio)
                 is_cross_script_arr[idx] = cand_is_cross_script
-                translit_name_ratio_arr[idx] = (
-                    fuzz.ratio(s1_translit_name, cand_translit_name) / 100.0
-                )
+                if s1_translit_name == s1_soft_name and not has_distinct_translit_name:
+                    translit_name_ratio_arr[idx] = raw_soft_ratio
+                else:
+                    translit_name_ratio_arr[idx] = (
+                        fuzz.ratio(s1_translit_name, cand_translit_name) / 100.0
+                    )
 
                 # --- 39-41: Name Core & Legal Suffix Analysis ---
                 name_core_ratio_arr[idx] = fuzz.ratio(s1_core, cand_core) / 100.0
