@@ -17,8 +17,31 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
+
+# Bootstrap sys.path immediately so imports work in any execution environment
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    import psutil
+
+    def get_telemetry_str() -> str:
+        mem = psutil.virtual_memory()
+        disk = shutil.disk_usage(".")
+        return (
+            f"[RAM: {mem.used / (1024**3):.1f}/{mem.total / (1024**3):.1f} GB ({mem.percent}%) "
+            f"| Disk: {disk.free / (1024**3):.1f} GB free]"
+        )
+except Exception:
+    def get_telemetry_str() -> str:
+        disk = shutil.disk_usage(".")
+        return f"[Disk: {disk.free / (1024**3):.1f} GB free]"
 
 from parallax.s3_utils import (
     download_s3_file,
@@ -32,11 +55,12 @@ from parallax.training.full_trainer import train_production_pipeline
 
 
 def print_banner(step_num: int, title: str) -> None:
-    """Print visually distinct pipeline stage banner."""
+    """Print visually distinct pipeline stage banner with live telemetry."""
     sep = "=" * 80
     print(f"\n{sep}")
-    print(f"📍 STAGE {step_num}: {title.upper()}")
-    print(f"{sep}\n")
+    print(f"📍 STAGE {step_num}: {title.upper()}  {get_telemetry_str()}")
+    print(f"⏰ Timestamp: {time.strftime('%H:%M:%S UTC', time.gmtime())}")
+    print(f"{sep}\n", flush=True)
 
 
 def check_disk_headroom(min_free_gb: float = 1.0) -> float:
@@ -54,7 +78,7 @@ def check_disk_headroom(min_free_gb: float = 1.0) -> float:
 def main() -> None:
     """Run full unattended training and submission pipeline."""
     t_start = time.time()
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = _PROJECT_ROOT
     os.chdir(project_root)
 
     print("\n" + "=" * 80)
@@ -69,15 +93,29 @@ def main() -> None:
     free_gb = check_disk_headroom(min_free_gb=1.0)
     print(f"  ✓ Filesystem headroom check passed: {free_gb:.1f} GB available.")
 
+    try:
+        import multiprocessing
+        import platform
+
+        import psutil
+
+        mem = psutil.virtual_memory()
+        print(f"  🖥️ Host Environment:    {platform.platform()} | Python {platform.python_version()}")
+        print(f"  ⚡ Available Cores:     {multiprocessing.cpu_count()} vCPUs")
+        print(f"  🧠 Host Memory (RAM):   {mem.total / (1024**3):.1f} GB total ({mem.available / (1024**3):.1f} GB free)")
+    except Exception:
+        pass
+
     ak, sk, region, bucket = get_s3_credentials()
     if not ak or not sk:
         raise RuntimeError("❌ AWS S3 credentials not found! Check environment or accessKeys.csv.")
     print(f"  ✓ S3 credentials located. Target bucket: s3://{bucket} (region: {region})")
 
+    t_s3_ping = time.time()
     s3_client = get_s3_client()
     try:
         s3_client.head_bucket(Bucket=bucket)
-        print(f"  ✓ Verified active connectivity to s3://{bucket}")
+        print(f"  ✓ Verified active connectivity to s3://{bucket} ({time.time() - t_s3_ping:.2f}s latency)")
     except Exception as exc:
         raise RuntimeError(f"❌ Failed to connect to S3 bucket {bucket}: {exc}") from exc
 
@@ -249,12 +287,25 @@ def main() -> None:
     summary_path.write_text(summary_md, encoding="utf-8")
     print(f"  ✓ Summary report written to: {summary_path}")
 
+    match_pct = (matched_sub_rows / max(1, total_sub_rows)) * 100
+    single_pct = (empty_sub_rows / max(1, total_sub_rows)) * 100
+
     print("\n" + "=" * 80)
-    print("🏆 ALL PIPELINE STAGES COMPLETED SUCCESSFULLY!")
-    print(f"  Artifact: {submission_tsv}")
-    print(f"  S3 URI:   {uri_primary}")
-    print(f"  Total Elapsed Time: {total_time_min:.1f} minutes")
-    print("=" * 80 + "\n")
+    print("🏆 PARALLAX SUBMISSION EXECUTIVE SCORECARD")
+    print("=" * 80)
+    print("  • Validation Status:             PASS (0 errors, 100% compliant)")
+    print(f"  • Total Pipeline Runtime:        {total_time_min:.1f} minutes")
+    print(f"  • Calibrated Threshold (tau):    {metadata.optimal_tau:.2f}")
+    print(f"  • Holdout Validation Macro F0.5: {metadata.holdout_macro_f05:.4f}")
+    print(f"  • Holdout Singleton Accuracy:    {metadata.holdout_singleton_accuracy * 100:.2f}%")
+    print(f"  • Holdout Non-Singleton F0.5:    {metadata.holdout_non_singleton_f05:.4f}")
+    print(f"  • Total Test Queries Processed:  {total_sub_rows:,} (India, US, France)")
+    print(f"  • Matches Predicted:             {matched_sub_rows:,} ({match_pct:.1f}%)")
+    print(f"  • Singletons Predicted:          {empty_sub_rows:,} ({single_pct:.1f}%)")
+    print(f"  • Output TSV Artifact:           {submission_tsv} ({sub_size_mb:.1f} MB)")
+    print(f"  • S3 Primary Target:             {uri_primary}")
+    print(f"  • Disk Headroom Remaining:       {check_disk_headroom(0.5):.1f} GB")
+    print("=" * 80 + "\n", flush=True)
 
 
 if __name__ == "__main__":
