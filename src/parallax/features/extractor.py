@@ -174,169 +174,178 @@ FEATURE_COLUMNS = [
 class PairwiseFeatureExtractor:
     """Extracts comparative similarity features for candidate pairs."""
 
+    @staticmethod
+    def build_record_lookup(
+        df: pd.DataFrame,
+        needed_ids: Collection[str] | None = None,
+    ) -> dict[
+        str,
+        tuple[
+            str,  # raw_name
+            str,  # soft_name
+            str,  # translit_name
+            str,  # addr
+            str,  # translit_addr
+            set[str],  # nums
+            int,  # is_null
+            str | None,  # primary_num
+            str | None,  # postal_code
+            str,  # canon_addr
+            set[str],  # name_toks
+            str,  # first_tok
+            set[str],  # addr_toks
+            str | None,  # city_tok
+            str,  # core_name
+            str | None,  # suffix_class
+            str,  # phonetic_code
+            str,  # country
+            float,  # is_cross_script
+        ],
+    ]:
+        if needed_ids is not None and "entity_id" in df:
+            id_ser = df["entity_id"].astype(str)
+            mask = id_ser.isin(needed_ids)
+            if not mask.all():
+                df = df[mask].reset_index(drop=True)
+
+        raw_names = (
+            df["business_name"].fillna("").astype(str).tolist()
+            if "business_name" in df
+            else [""] * len(df)
+        )
+        soft_names = (
+            df["soft_name"].fillna("").astype(str).tolist()
+            if "soft_name" in df
+            else [n.lower() for n in raw_names]
+        )
+        translit_names = (
+            df["translit_name"].fillna("").astype(str).tolist()
+            if "translit_name" in df
+            else soft_names
+        )
+        addrs = (
+            df["clean_address"].fillna("").astype(str).tolist()
+            if "clean_address" in df
+            else [""] * len(df)
+        )
+        translit_addrs = (
+            df["translit_address"].fillna("").astype(str).tolist()
+            if "translit_address" in df
+            else addrs
+        )
+        nums = df["numbers"].tolist() if "numbers" in df else [set()] * len(df)
+        nulls = (
+            df["is_addr_null"].astype(int).tolist() if "is_addr_null" in df else [0] * len(df)
+        )
+        primary_nums = (
+            df["primary_number"].tolist() if "primary_number" in df else [None] * len(df)
+        )
+        postal_codes = df["postal_code"].tolist() if "postal_code" in df else [None] * len(df)
+        canon_addrs = (
+            df["canon_address"].fillna("").astype(str).tolist()
+            if "canon_address" in df
+            else addrs
+        )
+        if "city_token" in df:
+            city_tokens = df["city_token"].tolist()
+        elif "business_address" in df:
+            from parallax.preprocessing.normalizer import extract_city_token
+
+            city_tokens = df["business_address"].apply(extract_city_token).tolist()
+        else:
+            city_tokens = [None] * len(df)
+
+        country_list = (
+            df["country"].fillna("").astype(str).tolist() if "country" in df else [""] * len(df)
+        )
+
+        ids = df["entity_id"].astype(str).tolist()
+
+        lookup = {}
+        for i, eid in enumerate(ids):
+            rn = raw_names[i]
+            sn = soft_names[i] or rn.lower()
+            tn = translit_names[i] or sn
+            ad = addrs[i]
+            tad = translit_addrs[i] or ad
+            n_set = _normalize_num_set(nums[i])
+            nl = nulls[i]
+            pn = (
+                str(primary_nums[i]).strip()
+                if pd.notna(primary_nums[i])
+                and str(primary_nums[i]).strip().lower() not in ("", "none", "nan")
+                else None
+            )
+            pc = (
+                str(postal_codes[i]).strip()
+                if pd.notna(postal_codes[i])
+                and str(postal_codes[i]).strip().lower() not in ("", "none", "nan")
+                else None
+            )
+            ca = canon_addrs[i] or ad
+            sn_words = sn.split()
+            name_toks = set(sn_words)
+            first_tok = sn_words[0] if sn_words else ""
+            addr_toks = set(ca.split())
+            ct = (
+                str(city_tokens[i]).strip()
+                if pd.notna(city_tokens[i])
+                and str(city_tokens[i]).strip().lower() not in ("", "none", "nan")
+                else None
+            )
+            core_name, suffix_class = extract_core_and_suffix(sn)
+            phonetic_code = jellyfish.metaphone(first_tok) if first_tok else ""
+            country = country_list[i]
+            is_cross_script = 1.0 if any(ord(c) > 127 for c in rn) else 0.0
+
+            lookup[eid] = (
+                rn,
+                sn,
+                tn,
+                ad,
+                tad,
+                n_set,
+                nl,
+                pn,
+                pc,
+                ca,
+                name_toks,
+                first_tok,
+                addr_toks,
+                ct,
+                core_name,
+                suffix_class,
+                phonetic_code,
+                country,
+                is_cross_script,
+            )
+        return lookup
+
     def extract_features_df(
         self,
-        candidate_pairs: Mapping[str, Collection[str] | dict[str, float]],
+        candidate_pairs: Mapping[str, Collection[str] | Mapping[str, float]],
         s1_df: pd.DataFrame,
-        target_df: pd.DataFrame,
+        target_df: pd.DataFrame | None = None,
         ground_truth: Mapping[str, set[str]] | None = None,
         show_progress: bool = True,
+        target_lookup: Mapping[str, Any] | None = None,
     ) -> pd.DataFrame:
         """
         Build a tabular feature matrix for all candidate pairs.
         If ground_truth is provided, appends the binary target column.
+        Accepts either target_df or precomputed target_lookup to maximize throughput.
         """
-
-        def _build_record_lookup(
-            df: pd.DataFrame,
-            needed_ids: Collection[str] | None = None,
-        ) -> dict[
-            str,
-            tuple[
-                str,  # raw_name
-                str,  # soft_name
-                str,  # translit_name
-                str,  # addr
-                str,  # translit_addr
-                set[str],  # nums
-                int,  # is_null
-                str | None,  # primary_num
-                str | None,  # postal_code
-                str,  # canon_addr
-                set[str],  # name_toks
-                str,  # first_tok
-                set[str],  # addr_toks
-                str | None,  # city_tok
-                str,  # core_name
-                str | None,  # suffix_class
-                str,  # phonetic_code
-                str,  # country
-                float,  # is_cross_script
-            ],
-        ]:
-            if needed_ids is not None and "entity_id" in df:
-                id_ser = df["entity_id"].astype(str)
-                mask = id_ser.isin(needed_ids)
-                if not mask.all():
-                    df = df[mask].reset_index(drop=True)
-
-            raw_names = (
-                df["business_name"].fillna("").astype(str).tolist()
-                if "business_name" in df
-                else [""] * len(df)
-            )
-            soft_names = (
-                df["soft_name"].fillna("").astype(str).tolist()
-                if "soft_name" in df
-                else [n.lower() for n in raw_names]
-            )
-            translit_names = (
-                df["translit_name"].fillna("").astype(str).tolist()
-                if "translit_name" in df
-                else soft_names
-            )
-            addrs = (
-                df["clean_address"].fillna("").astype(str).tolist()
-                if "clean_address" in df
-                else [""] * len(df)
-            )
-            translit_addrs = (
-                df["translit_address"].fillna("").astype(str).tolist()
-                if "translit_address" in df
-                else addrs
-            )
-            nums = df["numbers"].tolist() if "numbers" in df else [set()] * len(df)
-            nulls = (
-                df["is_addr_null"].astype(int).tolist() if "is_addr_null" in df else [0] * len(df)
-            )
-            primary_nums = (
-                df["primary_number"].tolist() if "primary_number" in df else [None] * len(df)
-            )
-            postal_codes = df["postal_code"].tolist() if "postal_code" in df else [None] * len(df)
-            canon_addrs = (
-                df["canon_address"].fillna("").astype(str).tolist()
-                if "canon_address" in df
-                else addrs
-            )
-            if "city_token" in df:
-                city_tokens = df["city_token"].tolist()
-            elif "business_address" in df:
-                from parallax.preprocessing.normalizer import extract_city_token
-
-                city_tokens = df["business_address"].apply(extract_city_token).tolist()
-            else:
-                city_tokens = [None] * len(df)
-
-            country_list = (
-                df["country"].fillna("").astype(str).tolist() if "country" in df else [""] * len(df)
-            )
-
-            ids = df["entity_id"].astype(str).tolist()
-
-            lookup = {}
-            for i, eid in enumerate(ids):
-                rn = raw_names[i]
-                sn = soft_names[i] or rn.lower()
-                tn = translit_names[i] or sn
-                ad = addrs[i]
-                tad = translit_addrs[i] or ad
-                n_set = _normalize_num_set(nums[i])
-                nl = nulls[i]
-                pn = (
-                    str(primary_nums[i]).strip()
-                    if pd.notna(primary_nums[i])
-                    and str(primary_nums[i]).strip().lower() not in ("", "none", "nan")
-                    else None
-                )
-                pc = (
-                    str(postal_codes[i]).strip()
-                    if pd.notna(postal_codes[i])
-                    and str(postal_codes[i]).strip().lower() not in ("", "none", "nan")
-                    else None
-                )
-                ca = canon_addrs[i] or ad
-                sn_words = sn.split()
-                name_toks = set(sn_words)
-                first_tok = sn_words[0] if sn_words else ""
-                addr_toks = set(ca.split())
-                ct = (
-                    str(city_tokens[i]).strip()
-                    if pd.notna(city_tokens[i])
-                    and str(city_tokens[i]).strip().lower() not in ("", "none", "nan")
-                    else None
-                )
-                core_name, suffix_class = extract_core_and_suffix(sn)
-                phonetic_code = jellyfish.metaphone(first_tok) if first_tok else ""
-                country = country_list[i]
-                is_cross_script = 1.0 if any(ord(c) > 127 for c in rn) else 0.0
-
-                lookup[eid] = (
-                    rn,
-                    sn,
-                    tn,
-                    ad,
-                    tad,
-                    n_set,
-                    nl,
-                    pn,
-                    pc,
-                    ca,
-                    name_toks,
-                    first_tok,
-                    addr_toks,
-                    ct,
-                    core_name,
-                    suffix_class,
-                    phonetic_code,
-                    country,
-                    is_cross_script,
-                )
-            return lookup
-
         needed_s1 = set(candidate_pairs.keys())
-        needed_target = {cand for cands in candidate_pairs.values() for cand in cands}
-        s1_dict = _build_record_lookup(s1_df, needed_ids=needed_s1)
-        target_dict = _build_record_lookup(target_df, needed_ids=needed_target)
+        s1_dict = self.build_record_lookup(s1_df, needed_ids=needed_s1)
+        if target_lookup is not None:
+            target_dict = target_lookup
+        else:
+            if target_df is None:
+                raise ValueError(
+                    "Either target_df or target_lookup must be provided to extract_features_df."
+                )
+            needed_target = {cand for cands in candidate_pairs.values() for cand in cands}
+            target_dict = self.build_record_lookup(target_df, needed_ids=needed_target)
 
         total_pairs = sum(len(cands) for cands in candidate_pairs.values())
         if total_pairs == 0:

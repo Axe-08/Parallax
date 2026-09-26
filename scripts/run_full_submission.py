@@ -15,6 +15,7 @@ and real test submission pipeline:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
@@ -150,17 +151,41 @@ def main() -> None:
     # STAGE 2: Train Production Models on 100% Full Dataset
     # ---------------------------------------------------------
     print_banner(2, "Train Production Two-Pass Models (100% Full Dataset)")
-    t_train_start = time.time()
-    metadata = train_production_pipeline(
-        train_dir=raw_train_dir,
-        output_dir=project_root / "output",
-        holdout_size=5_000,
-        sample_queries_per_country=15_000,
-    )
-    t_train_elapsed = time.time() - t_train_start
-    print(f"  ✓ Production training finished in {t_train_elapsed / 60:.1f} minutes.")
-    print(f"  ✓ Optimal Decision Threshold (tau): {metadata.optimal_tau:.2f}")
-    print(f"  ✓ Holdout Macro F0.5:             {metadata.holdout_macro_f05:.4f}")
+    meta_path = models_dir / "production_metadata.json"
+    p1_path = models_dir / "production_pass1.txt"
+    p2_path = models_dir / "production_pass2.txt"
+
+    if meta_path.is_file() and p1_path.is_file() and p2_path.is_file():
+        print("  ⚡ Found pre-existing trained production models. Re-using cached models!")
+        import json
+
+        with open(meta_path, encoding="utf-8") as f:
+            meta_dict = json.load(f)
+        tau_val = float(meta_dict.get("optimal_tau", 0.82))
+        f05_val = float(meta_dict.get("holdout_macro_f05", 0.0))
+        print(f"  ✓ Optimal Decision Threshold (tau): {tau_val:.2f}")
+        print(f"  ✓ Holdout Macro F0.5:             {f05_val:.4f}")
+    else:
+        t_train_start = time.time()
+        metadata = train_production_pipeline(
+            train_dir=raw_train_dir,
+            output_dir=project_root / "output",
+            holdout_size=5_000,
+            sample_queries_per_country=15_000,
+        )
+        t_train_elapsed = time.time() - t_train_start
+        print(f"  ✓ Production training finished in {t_train_elapsed / 60:.1f} minutes.")
+        print(f"  ✓ Optimal Decision Threshold (tau): {metadata.optimal_tau:.2f}")
+        print(f"  ✓ Holdout Macro F0.5:             {metadata.holdout_macro_f05:.4f}")
+
+    # Immediately preserve trained models & metadata to S3 for analysis
+    try:
+        upload_s3_file(meta_path, "models/production_metadata.json", bucket=bucket, client=s3_client)
+        upload_s3_file(p1_path, "models/production_pass1.txt", bucket=bucket, client=s3_client)
+        upload_s3_file(p2_path, "models/production_pass2.txt", bucket=bucket, client=s3_client)
+        print("  ✓ Synchronized trained models and calibration metadata to S3.")
+    except Exception as exc:
+        print(f"  ⚠️ Note: Could not back up models to S3: {exc}")
 
     # ---------------------------------------------------------
     # STAGE 3: Download Raw Test Data from S3
@@ -187,7 +212,8 @@ def main() -> None:
         test_dir=raw_test_dir,
         models_dir=models_dir,
         output_tsv_path=submission_tsv,
-        chunk_size=5_000,
+        chunk_size=20_000,
+        batch_size=2_000,
     )
     t_inf_elapsed = time.time() - t_inf_start
     print(f"  ✓ Test inference completed in {t_inf_elapsed / 60:.1f} minutes.")
@@ -224,6 +250,18 @@ def main() -> None:
     uri_primary = upload_s3_file(submission_tsv, s3_primary_key, bucket=bucket, client=s3_client)
     upload_s3_file(submission_tsv, s3_archive_key, bucket=bucket, client=s3_client)
     print(f"  ✓ Published to: {uri_primary}")
+
+    # Synchronize all diagnostic and analysis reports to S3
+    for report_file in reports_dir.glob("*"):
+        if report_file.is_file():
+            with contextlib.suppress(Exception):
+                upload_s3_file(
+                    report_file,
+                    f"reports/{report_file.name}",
+                    bucket=bucket,
+                    client=s3_client,
+                )
+    print("  ✓ All diagnostic analysis reports synchronized to S3.")
 
     # ---------------------------------------------------------
     # STAGE 7: Executive Summary Report

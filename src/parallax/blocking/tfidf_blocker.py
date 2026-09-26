@@ -70,7 +70,7 @@ class DualChannelTFIDFBlocker:
         addr_top_k: int = 25,
         name_min_sim: float = 0.15,
         addr_min_sim: float = 0.20,
-        batch_size: int = 50,
+        batch_size: int = 1000,
         show_progress: bool = True,
     ) -> None:
         self.name_top_k = name_top_k
@@ -224,7 +224,7 @@ class DualChannelTFIDFBlocker:
             if sim > curr:
                 candidate_pairs[s1_id][cand_id] = float(sim)
 
-        bs = batch_size if batch_size is not None else min(self.batch_size, 50)
+        bs = batch_size if batch_size is not None else self.batch_size
         s1_names = build_blocking_texts(s1_c, "soft_name", "business_name", "translit_name")
         s1_addrs = build_blocking_texts(
             s1_c, "clean_address", "business_address", "translit_address"

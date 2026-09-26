@@ -52,15 +52,16 @@ def run_streaming_test_inference(
     test_dir: Path,
     models_dir: Path,
     output_tsv_path: Path,
-    chunk_size: int = 5_000,
+    chunk_size: int = 20_000,
     blocker_top_k: int = 30,
+    batch_size: int = 2_000,
 ) -> Path:
     """
     Execute streaming inference on full test dataset:
     1. Loads production Pass 1 and Pass 2 LightGBM boosters.
     2. Reads metadata for calibrated threshold tau.
     3. Ingests test records (test_source1, test_source2, test_source3).
-    4. Streams inference country-by-country in chunks to guarantee RAM < 8 GB.
+    4. Streams inference country-by-country in chunks to guarantee high throughput and bounded RAM.
     5. Writes final matching_results.tsv preserving exact test_source1 entity ordering.
     """
     output_tsv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,12 +154,24 @@ def run_streaming_test_inference(
             addr_top_k=min(20, blocker_top_k),
             name_min_sim=0.15,
             addr_min_sim=0.20,
-            batch_size=50,
+            batch_size=batch_size,
             show_progress=False,
         )
         blocker.index_country_targets(tgt_c, country=country)
-        print(f"  ✓ Widened and pre-indexed targets for [{country}] in {time.time() - t0_wc:.2f}s.")
+        print(f"  ✓ Indexed TF-IDF target matrices in {time.time() - t0_wc:.2f}s.")
+
+        print(f"  ⚡ Pre-building in-memory record lookup for [{country}]...")
+        t0_lk = time.time()
+        country_target_lookup = extractor.build_record_lookup(tgt_c)
+        print(
+            f"  ✓ Target lookup built in {time.time() - t0_lk:.2f}s "
+            f"({len(country_target_lookup):,} entities)."
+        )
         print_resource_status()
+
+        # Free DataFrame tgt_c now that target_lookup and sparse matrices exist in memory
+        del tgt_c
+        gc.collect()
 
         n_chunks = int(np.ceil(len(s1_raw_c) / chunk_size))
         pbar = tqdm(
@@ -176,7 +189,7 @@ def run_streaming_test_inference(
             chunk_s1_ids = s1_chunk["entity_id"].astype(str).tolist()
 
             # 1. Candidate Generation against pre-indexed targets
-            candidates = blocker.block_queries(s1_chunk, country=country, batch_size=50)
+            candidates = blocker.block_queries(s1_chunk, country=country, batch_size=batch_size)
             total_pairs = sum(len(v) for v in candidates.values())
 
             if total_pairs == 0:
@@ -189,9 +202,9 @@ def run_streaming_test_inference(
             features_df = extractor.extract_features_df(
                 candidates,
                 s1_chunk,
-                tgt_c,
                 ground_truth=None,
                 show_progress=False,
+                target_lookup=country_target_lookup,
             )
 
             if len(features_df) > 0:
@@ -217,7 +230,7 @@ def run_streaming_test_inference(
 
         # Free country targets and blocker index
         blocker.clear_index()
-        del tgt_c, s1_raw_c, blocker
+        del country_target_lookup, s1_raw_c, blocker
         gc.collect()
 
     del s1_df, target_df
