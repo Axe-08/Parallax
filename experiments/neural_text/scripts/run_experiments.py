@@ -107,6 +107,7 @@ def train_and_eval_fold(
         "max_depth": 6,
         "verbose": -1,
         "seed": seed,
+        "n_jobs": 8,
     }
 
     t0_train = time.time()
@@ -225,6 +226,10 @@ def run_experiment_arm(
     classification_fns = total_true_in_data - total_tps
     blocking_fns = total_ground_truth_pairs - total_true_in_data
     false_merges = full_report.total_predicted_pairs - total_tps
+    singleton_violations = sum(
+        1 for s1, gt_set in ground_truth.items()
+        if len(gt_set) == 0 and len(all_oof_preds.get(s1, set())) > 0
+    )
 
     # Cross-script true pair recovery (candidates with Indic characters)
     # Check predictions for cross-script pairs using the boolean indicator
@@ -267,7 +272,7 @@ def run_experiment_arm(
         classification_fns=int(classification_fns),
         blocking_fns=int(blocking_fns),
         false_merges=int(false_merges),
-        singleton_violations=int(full_report.singleton_violations),
+        singleton_violations=int(singleton_violations),
         cross_script_tps_recovered=int(cs_recovered),
         new_false_merges_vs_e0=int(new_fm),
         recovered_fns_vs_e0=int(recovered_fn),
