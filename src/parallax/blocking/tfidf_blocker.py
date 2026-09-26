@@ -35,10 +35,10 @@ class DualChannelTFIDFBlocker:
         self,
         name_top_k: int = 35,
         addr_top_k: int = 25,
-        translit_top_k: int = 20,
+        translit_top_k: int = 5,
         name_min_sim: float = 0.15,
         addr_min_sim: float = 0.20,
-        translit_min_sim: float = 0.15,
+        translit_min_sim: float = 0.30,
         batch_size: int = 2000,
         show_progress: bool = True,
     ) -> None:
