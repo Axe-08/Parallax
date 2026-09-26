@@ -1,0 +1,106 @@
+# Parallax Neural Representation Experiment Configuration
+# =========================================================
+
+experiment_name: "neural_representation_e0_e3"
+version: "1.0.0"
+
+# Default execution scale: "5000" or "200000"
+scale: "5000"
+
+# Dataset file paths per scale
+datasets:
+  "5000":
+    data_dir: "data/medium_split_200k"
+    s1_path: "data/medium_split_200k/train_source1.tsv"
+    s2_path: "data/medium_split_200k/train_source2.tsv"
+    s3_path: "data/medium_split_200k/train_source3.tsv"
+    ground_truth_path: "data/medium_split_200k/train_ground_truth.tsv"
+    cv_folds_path: "data/medium_split_200k/cv_folds_source1.tsv"
+    baseline_candidates_path: "baseline_artifacts/candidate_pairs_sample.parquet"
+    baseline_features_path: "baseline_artifacts/features_sample.parquet"
+    s1_limit: 5000
+  "200000":
+    data_dir: "data/full_dataset"
+    s1_path: "data/medium_split_200k/train_source1.tsv"
+    s2_path: "data/medium_split_200k/train_source2.tsv"
+    s3_path: "data/medium_split_200k/train_source3.tsv"
+    ground_truth_path: "data/medium_split_200k/train_ground_truth.tsv"
+    cv_folds_path: "data/medium_split_200k/cv_folds_source1.tsv"
+    baseline_candidates_path: "data/full_dataset/candidate_pairs.parquet"
+    baseline_features_path: "data/full_dataset/features.parquet"
+    s1_limit: 200000
+
+# Cache directories
+cache:
+  root_dir: "experiments/neural_text/caches"
+  indicxlit_cache_path: "experiments/neural_text/caches/indicxlit_translit_cache.parquet"
+  qwen_name_cache_path: "experiments/neural_text/caches/qwen_name_embeddings.npz"
+  qwen_metadata_path: "experiments/neural_text/caches/qwen_metadata.json"
+  augmented_features_path: "experiments/neural_text/caches/augmented_features_{scale}.parquet"
+
+# IndicXlit configuration (AI4Bharat)
+indicxlit:
+  model_dir: null # Default to package internal or offline path
+  beam_width: 4
+  rescore: false
+  batch_size: 64
+  # Script to language mapping for Unicode blocks
+  script_lang_map:
+    "DEVANAGARI": "hi"
+    "BENGALI": "bn"
+    "GURMUKHI": "pa"
+    "GUJARATI": "gu"
+    "ORIYA": "or"
+    "TAMIL": "ta"
+    "TELUGU": "te"
+    "KANNADA": "kn"
+    "MALAYALAM": "ml"
+
+# Qwen3-Embedding-0.6B configuration
+qwen:
+  model_name_or_path: "Qwen/Qwen3-Embedding-0.6B"
+  # Optional local/kaggle offline directory: e.g. "/kaggle/input/qwen3-embedding-06b"
+  offline_path: null
+  device: "auto" # "auto", "cuda", "cpu"
+  batch_size: 64
+  max_length: 64 # Entity names are short (<30 tokens)
+  embedding_dim: 1024 # Supports MRL: 1024, 512, 256
+  normalize_embeddings: true
+  use_instruction: false # Symmetric comparison between business names
+  instruction: ""
+
+# Feature definitions for each experimental arm
+experiments:
+  E0:
+    name: "Baseline 28 features"
+    features: "baseline_28"
+  E1:
+    name: "Baseline 28 + IndicXlit Name Sim"
+    features: "baseline_plus_indicxlit"
+    added_features:
+      - "indicxlit_name_similarity"
+  E2:
+    name: "Baseline 28 + Qwen Name Cosine"
+    features: "baseline_plus_qwen"
+    added_features:
+      - "qwen_name_cosine"
+  E3:
+    name: "Baseline 28 + IndicXlit + Qwen"
+    features: "baseline_plus_both"
+    added_features:
+      - "indicxlit_name_similarity"
+      - "qwen_name_cosine"
+
+# Matcher & Evaluation Configuration (FROZEN to match Baseline)
+model:
+  learning_rate: 0.08
+  num_leaves: 31
+  max_depth: 6
+  n_estimators: 100
+  seed: 42
+  threshold_search_grid: [0.60, 0.65, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90]
+
+# Output directories
+output:
+  reports_dir: "experiments/neural_text/reports"
+  results_dir: "experiments/neural_text/results"
