@@ -28,7 +28,13 @@ from detect_script import (
 
 
 class IndicXlitCacheEngine:
-    """Manages multi-lingual IndicXlit engines with per-word mixed-script fallback."""
+    """
+    Manages multi-lingual Indic transliteration with per-word mixed-script fallback.
+    Supported backends in priority order:
+      1. indic-transliteration (Pure Python, Python 3.12+ compatible)
+      2. ai4bharat.transliteration (Fairseq backend if installed)
+      3. parallax.preprocessing.transliteration (Deterministic fallback)
+    """
 
     def __init__(
         self,
@@ -39,23 +45,29 @@ class IndicXlitCacheEngine:
         self.beam_width = beam_width
         self.rescore = rescore
         self.model_dir = model_dir
+        self.backend = "deterministic"
+        self.sanscript: Any = None
         self.engines: dict[str, Any] = {}
-        self._initialized = False
 
-    def _get_engine(self, lang_code: str) -> Any:
+        try:
+            from indic_transliteration import sanscript
+            self.sanscript = sanscript
+            self.backend = "indic-transliteration"
+            print("Transliteration Backend: 'indic-transliteration' (Python 3.12+ compatible).")
+        except ImportError:
+            try:
+                from ai4bharat.transliteration import XlitEngine  # type: ignore[import-not-found]
+                self.backend = "ai4bharat"
+                print("Transliteration Backend: 'ai4bharat-transliteration'.")
+            except ImportError:
+                print("Transliteration Backend: Built-in deterministic Brahmic transliteration fallback.")
+
+    def _get_ai4bharat_engine(self, lang_code: str) -> Any:
         """Lazily initialize and cache XlitEngine per language."""
         if lang_code in self.engines:
             return self.engines[lang_code]
+        from ai4bharat.transliteration import XlitEngine  # type: ignore[import-not-found]
 
-        try:
-            from ai4bharat.transliteration import XlitEngine  # type: ignore[import-not-found]
-        except ImportError as e:
-            raise ImportError(
-                "ai4bharat-transliteration is required to run IndicXlit. "
-                "Install it on Kaggle using: pip install ai4bharat-transliteration"
-            ) from e
-
-        # Initialize engine for Indic -> Roman (English)
         kwargs: dict[str, Any] = {
             "src_script_type": "indic",
             "beam_width": self.beam_width,
@@ -71,7 +83,7 @@ class IndicXlitCacheEngine:
     def transliterate_string(self, text: str | None) -> str:
         """
         Transliterate string with mixed-script awareness.
-        Translates Indic words using IndicXlit, keeps Latin/numeric words verbatim.
+        Translates Indic words, keeps Latin/numeric words verbatim.
         """
         if not text or not str(text).strip():
             return ""
@@ -83,20 +95,46 @@ class IndicXlitCacheEngine:
         segments = segment_mixed_script(raw_str)
         out_tokens: list[str] = []
 
+        script_to_sanscript = {
+            "DEVANAGARI": "devanagari",
+            "BENGALI": "bengali",
+            "GURMUKHI": "gurmukhi",
+            "GUJARATI": "gujarati",
+            "ORIYA": "oriya",
+            "TAMIL": "tamil",
+            "TELUGU": "telugu",
+            "KANNADA": "kannada",
+            "MALAYALAM": "malayalam",
+        }
+
         for item in segments:
             if item.lang_code is not None:
-                try:
-                    engine = self._get_engine(item.lang_code)
-                    # Returns {'<lang>': [best_word, ...]}
-                    res = engine.translit_word(item.token, topk=1)
-                    if isinstance(res, dict) and item.lang_code in res and res[item.lang_code]:
-                        best_translit = res[item.lang_code][0]
-                        out_tokens.append(best_translit)
-                    else:
-                        out_tokens.append(item.token)
-                except Exception:
-                    # Fallback on raw token if transliteration fails
-                    out_tokens.append(item.token)
+                translit_word = item.token
+                if self.backend == "indic-transliteration" and self.sanscript is not None:
+                    src_scheme = script_to_sanscript.get(item.script, "devanagari")
+                    try:
+                        translit_word = self.sanscript.transliterate(
+                            item.token, src_scheme, self.sanscript.ITRANS
+                        ).lower()
+                    except Exception:
+                        translit_word = item.token
+                elif self.backend == "ai4bharat":
+                    try:
+                        engine = self._get_ai4bharat_engine(item.lang_code)
+                        res = engine.translit_word(item.token, topk=1)
+                        if isinstance(res, dict) and item.lang_code in res and res[item.lang_code]:
+                            translit_word = res[item.lang_code][0]
+                    except Exception:
+                        translit_word = item.token
+                else:
+                    # Deterministic fallback
+                    try:
+                        from parallax.preprocessing.transliteration import transliterate_brahmic_to_latin
+                        translit_word = transliterate_brahmic_to_latin(item.token)
+                    except Exception:
+                        translit_word = item.token
+
+                out_tokens.append(translit_word)
             else:
                 out_tokens.append(item.token)
 
