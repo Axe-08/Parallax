@@ -43,10 +43,17 @@ def main():
 
     print("Loading Ground Truth and Baseline...")
     gt = pd.read_csv("data/medium_split_200k/train_ground_truth.tsv", sep="\t")
-    gt_true = gt[gt['target'] == 1].copy()
     s1_ids_5k = set(s1_df['entity_id'].astype(str))
-    gt_true = gt_true[gt_true['s1_id'].astype(str).isin(s1_ids_5k)]
-    gt_true_set = set(zip(gt_true['s1_id'].astype(str), gt_true['cand_id'].astype(str)))
+    gt_true_set = set()
+    
+    for _, row in gt.iterrows():
+        s1 = str(row['source1_entity_id'])
+        if s1 in s1_ids_5k:
+            matches = str(row['matched_entity_ids']).split(',')
+            for m in matches:
+                m = m.strip()
+                if m:
+                    gt_true_set.add((s1, m))
 
     baseline = pd.read_parquet("baseline_artifacts/candidate_pairs_sample.parquet")
     baseline_pairs = set(zip(baseline['s1_id'].astype(str), baseline['cand_id'].astype(str)))
