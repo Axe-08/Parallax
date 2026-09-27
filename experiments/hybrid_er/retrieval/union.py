@@ -31,9 +31,13 @@ def merge_candidate_tables(candidate_dfs: list, e0_features_df: pd.DataFrame = N
         d['s1_id'] = d['s1_id'].astype(str)
         d['cand_id'] = d['cand_id'].astype(str)
         if 'source' not in d.columns:
-            d['source'] = d['cand_id'].apply(lambda x: 'S2' if x.startswith('S2') else ('S3' if x.startswith('S3') else 'S2'))
-        else:
-            d['source'] = d['source'].astype(str)
+            raise ValueError(f"Candidate DataFrame is missing required 'source' column. Columns: {list(d.columns)}")
+            
+        d['source'] = d['source'].astype(str)
+        invalid_sources = d[~d['source'].isin(['S2', 'S3'])]
+        if not invalid_sources.empty:
+            raise ValueError(f"Invalid source found in candidates. Allowed: 'S2', 'S3'. Found: {invalid_sources['source'].unique()}")
+            
         if 'blocker' not in d.columns:
             d['blocker'] = 'unknown'
         else:

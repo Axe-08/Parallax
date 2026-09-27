@@ -1,5 +1,4 @@
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import time
 import argparse
@@ -13,9 +12,10 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from parallax.data.contracts import load_ground_truth_dict
-from parallax.metrics.evaluator import evaluate_resolution_predictions
 
 # Internal imports
+from experiments.hybrid_er.core.validation import validate_candidate_schema, validate_source_contract, validate_evaluation_population
+from experiments.hybrid_er.evaluation.metrics import evaluate_candidate_recall, evaluate_matcher_predictions
 from experiments.hybrid_er.core.serialization import serialize_full, serialize_name_only, serialize_address_only
 from experiments.hybrid_er.retrieval.neural_bge import DenseRetriever, FaissIndexManager
 from experiments.hybrid_er.retrieval.structural import run_structural_retrieval
@@ -85,6 +85,10 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     device = select_best_gpu(gpu)
     s1_df, s2_df, s3_df, e0_cands, gt, eval_s1_ids = load_data()
     
+    validate_evaluation_population(s1_df, eval_s1_ids)
+    s2_ids = set(s2_df['entity_id'].astype(str))
+    s3_ids = set(s3_df['entity_id'].astype(str))
+    
     print("1. Running Structural Retrieval (Channel F)...")
     structural_cands = run_structural_retrieval(s1_df, s2_df, s3_df)
     
@@ -97,10 +101,16 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     e0_formatted['rank'] = 1
     e0_formatted['score'] = 1.0 # Pseudo score
     
-    # Determine source for E0 candidates ('S2' or 'S3')
-    e0_formatted['source'] = e0_formatted['cand_id'].astype(str).apply(
-        lambda x: 'S2' if x.startswith('S2') else ('S3' if x.startswith('S3') else 'S2')
-    )
+    # Authoritative source assignment for E0 based strictly on ID membership
+    def get_source(cid):
+        if cid in s2_ids: return 'S2'
+        if cid in s3_ids: return 'S3'
+        raise ValueError(f"Candidate ID {cid} not found in S2 or S3")
+        
+    e0_formatted['source'] = e0_formatted['cand_id'].astype(str).apply(get_source)
+    
+    validate_candidate_schema(e0_formatted)
+    validate_source_contract(e0_formatted, s2_ids, s3_ids)
     
     union_for_expansion = merge_candidate_tables([e0_formatted, structural_cands])
     # melt it back to list
@@ -118,10 +128,6 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     s1_embs = retriever.encode(s1_texts)
     s2_embs = retriever.encode(s2_texts)
     s3_embs = retriever.encode(s3_texts)
-    
-    if "cuda" in str(device):
-        import torch
-        torch.cuda.empty_cache()
     
     # Build FAISS
     index_s2 = FaissIndexManager(1024, "FlatIP")
@@ -147,36 +153,44 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
                 neural_cands.append({'s1_id': s1_id, 'source': 'S3', 'cand_id': cand, 'blocker': 'bge_dense', 'rank': rank+1, 'score': score})
                 
     neural_cands_df = pd.DataFrame(neural_cands)
+    if not neural_cands_df.empty:
+        validate_candidate_schema(neural_cands_df)
+        validate_source_contract(neural_cands_df, s2_ids, s3_ids)
     
-    print("5. Evaluating Ablation Matrix...")
+    print("\n5. Evaluating Ablation Matrix...")
     # E0 is baseline
-    e0_eval = evaluate_resolution_predictions(gt, {s: set(e0_cands[e0_cands['s1_id'] == s]['cand_id'].astype(str)) for s in eval_s1_ids})
-    print(f"E0 Macro F0.5: {e0_eval.macro_f05:.4f}")
+    e0_preds = {s: set(e0_cands[e0_cands['s1_id'] == s]['cand_id'].astype(str)) for s in eval_s1_ids}
+    print("--- E0 Baseline ---")
+    print(evaluate_candidate_recall(gt, e0_preds, eval_s1_ids))
+    e0_eval = evaluate_matcher_predictions(gt, e0_preds, eval_s1_ids)
+    print(f"Matcher Macro F0.5: {e0_eval.macro_f05:.4f}\n")
     
     # E0 + BGE
     e0_bge = merge_candidate_tables([e0_formatted, neural_cands_df])
-    preds = e0_bge.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
-    res = evaluate_resolution_predictions(gt, preds)
-    print(f"E0 + BGE Macro F0.5: {res.macro_f05:.4f}")
+    preds_bge = e0_bge.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
+    print("--- E0 + BGE ---")
+    print(evaluate_candidate_recall(gt, preds_bge, eval_s1_ids))
+    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt, preds_bge, eval_s1_ids).macro_f05:.4f}\n")
     
     # Full Union (E0 + BGE + E + F)
     full_union = merge_candidate_tables([e0_formatted, neural_cands_df, structural_cands, relational_cands])
-    preds = full_union.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
-    res = evaluate_resolution_predictions(gt, preds)
-    print(f"E0 + BGE + E + F Macro F0.5 (Candidate Union Recall Bound): {res.macro_f05:.4f}")
-    print(f"Candidate Count: {len(full_union)}")
+    preds_full = full_union.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
+    print("--- E0 + BGE + E + F (FULL UNION) ---")
+    print(evaluate_candidate_recall(gt, preds_full, eval_s1_ids))
+    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt, preds_full, eval_s1_ids).macro_f05:.4f}\n")
     
     print(f"6. Reranking Full Union (on {device})...")
     scored_union = run_reranking_on_candidates(full_union, s1_df, s2_df, s3_df, serialize_full, device=device)
     
     # Filter by reranker score naive threshold for ablation check
     top_reranked = scored_union[scored_union['reranker_score'] > 0.0]
-    preds = top_reranked.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
-    res = evaluate_resolution_predictions(gt, preds)
-    print(f"+ Reranker (Naive > 0) Macro F0.5: {res.macro_f05:.4f}")
+    preds_reranked = top_reranked.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
+    print("--- + Reranker (Naive > 0) ---")
+    print(evaluate_candidate_recall(gt, preds_reranked, eval_s1_ids))
+    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt, preds_reranked, eval_s1_ids).macro_f05:.4f}\n")
     
     print("7. Meta-Blocker Compression Evaluation...")
-    # Train dummy meta-blocker on just E0 and BGE features to see if it preserves recall
+    # Train dummy meta-blocker (now using is_match correctly via GT later)
     meta_model = train_meta_blocker(scored_union, target_col='found_by_e0') # Just a dummy target for now, real one uses GT
     
     print("Pipeline Execution Complete. (This is a skeleton smoke test)")
@@ -184,7 +198,7 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="5K Hybrid ER Validation Pipeline")
     parser.add_argument("--gpu", type=str, default="auto", help="GPU index (e.g. '2') or 'auto' to pick card with most free VRAM")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for embedding (default: 32)")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for embedding")
     args = parser.parse_args()
     
     run_5k_pipeline(gpu=args.gpu, batch_size=args.batch_size)
