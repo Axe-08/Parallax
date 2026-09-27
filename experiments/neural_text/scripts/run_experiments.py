@@ -161,7 +161,9 @@ def train_and_eval_fold(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     feature_cols: list[str],
+    train_gt: dict[str, set[str]],
     val_gt: dict[str, set[str]],
+    train_s1_ids: list[str],
     val_s1_ids: list[str],
     seed: int = 42,
     threshold_grid: tuple[float, ...] = (0.60, 0.65, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90),
@@ -196,25 +198,29 @@ def train_and_eval_fold(
     train_time = time.time() - t0_train
 
     t0_infer = time.time()
+    train_probs = booster.predict(x_train)
     probs = booster.predict(x_val)
     infer_time = time.time() - t0_infer
 
-    # Threshold optimization on validation set
+    # Threshold optimization on TRAIN set
     predictor = SingletonGatedPredictor()
-    val_eval_df = val_df[["s1_id", "cand_id"]].copy()
-    val_eval_df["prob"] = probs
+    train_eval_df = train_df[["s1_id", "cand_id"]].copy()
+    train_eval_df["prob"] = train_probs
 
     best_tau = 0.74
     best_score = -1.0
-    best_preds: dict[str, set[str]] = {}
 
     for tau in threshold_grid:
-        preds = predictor.filter_predictions(val_eval_df, val_s1_ids, threshold=tau)
-        rep = evaluate_resolution_predictions(val_gt, preds)
+        preds = predictor.filter_predictions(train_eval_df, train_s1_ids, threshold=tau)
+        rep = evaluate_resolution_predictions(train_gt, preds)
         if rep.macro_f05 > best_score:
             best_score = rep.macro_f05
             best_tau = tau
-            best_preds = preds
+
+    # Evaluate on VALIDATION set using chosen tau
+    val_eval_df = val_df[["s1_id", "cand_id"]].copy()
+    val_eval_df["prob"] = probs
+    best_preds = predictor.filter_predictions(val_eval_df, val_s1_ids, threshold=best_tau)
 
     final_report = evaluate_resolution_predictions(val_gt, best_preds)
     prec = (
@@ -274,11 +280,20 @@ def run_experiment_arm(
         train_sub = augmented_df[train_mask]
         val_sub = augmented_df[val_mask].copy()
 
+        train_s1_set = set(cv_folds_df[cv_folds_df["fold"] != k][entity_col].astype(str))
+        train_gt = {s1: ground_truth.get(s1, set()) for s1 in train_s1_set}
         val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k][entity_col].astype(str))
         val_gt = {s1: ground_truth.get(s1, set()) for s1 in val_s1_set}
 
         res, _, fold_preds = train_and_eval_fold(
-            train_sub, val_sub, feature_cols, val_gt, list(val_s1_set), seed=42 + k
+            train_sub,
+            val_sub,
+            feature_cols,
+            train_gt,
+            val_gt,
+            list(train_s1_set),
+            list(val_s1_set),
+            seed=42 + k,
         )
         res.fold = k
         fold_results.append(res)
