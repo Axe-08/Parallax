@@ -3,6 +3,7 @@ import numpy as np
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler
 import sys
 from tqdm import tqdm
 
@@ -146,7 +147,7 @@ def main():
         for name, (s1_mat, tgt_mat_T) in vec_models.items():
             scores_dict[name] = s1_mat[i].dot(tgt_mat_T).toarray()[0]
             
-        jw_scores = process.cdist([s1_names[i]], tgt_names, scorer=fuzz.jaro_winkler)[0] / 100.0
+        jw_scores = process.cdist([s1_names[i]], tgt_names, scorer=JaroWinkler.normalized_similarity)[0]
         ts_scores = process.cdist([s1_names[i]], tgt_names, scorer=fuzz.token_sort_ratio)[0] / 100.0
         
         scores_dict["Jaro_Winkler"] = jw_scores
