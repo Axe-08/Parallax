@@ -12,8 +12,7 @@ class Reranker:
             self.device = device
             
         self.batch_size = batch_size
-        self.model = CrossEncoder(model_name, device=self.device)
-        # Note: Depending on CrossEncoder version, some take a dict of kwargs for inference
+        self.model = CrossEncoder(model_name, max_length=256, device=self.device)
 
     def score_pairs(self, pairs: List[List[str]], show_progress_bar: bool = True) -> np.ndarray:
         """
@@ -22,12 +21,16 @@ class Reranker:
         if not pairs:
             return np.array([])
             
-        with torch.autocast(device_type=self.device if self.device != 'cpu' else 'cpu', enabled=(self.device == 'cuda')):
-            scores = self.model.predict(
-                pairs, 
-                batch_size=self.batch_size, 
-                show_progress_bar=show_progress_bar
-            )
+        is_cuda = "cuda" in str(self.device)
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda" if is_cuda else "cpu", dtype=torch.float16 if is_cuda else torch.float32, enabled=is_cuda):
+                scores = self.model.predict(
+                    pairs, 
+                    batch_size=self.batch_size, 
+                    show_progress_bar=show_progress_bar
+                )
+        if is_cuda:
+            torch.cuda.empty_cache()
         return scores
 
 def run_reranking_on_candidates(candidate_df: pd.DataFrame, s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame, serializer_fn, device: str = None) -> pd.DataFrame:

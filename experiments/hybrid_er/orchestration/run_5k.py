@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import time
 import argparse
@@ -118,6 +119,10 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     s2_embs = retriever.encode(s2_texts)
     s3_embs = retriever.encode(s3_texts)
     
+    if "cuda" in str(device):
+        import torch
+        torch.cuda.empty_cache()
+    
     # Build FAISS
     index_s2 = FaissIndexManager(1024, "FlatIP")
     index_s2.add(s2_embs, [str(x) for x in s2_df['entity_id']])
@@ -179,7 +184,7 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="5K Hybrid ER Validation Pipeline")
     parser.add_argument("--gpu", type=str, default="auto", help="GPU index (e.g. '2') or 'auto' to pick card with most free VRAM")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for embedding")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for embedding (default: 32)")
     args = parser.parse_args()
     
     run_5k_pipeline(gpu=args.gpu, batch_size=args.batch_size)

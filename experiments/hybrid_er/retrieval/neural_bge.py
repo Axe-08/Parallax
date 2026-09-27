@@ -15,21 +15,25 @@ class DenseRetriever:
             
         self.batch_size = batch_size
         self.model = SentenceTransformer(model_name, device=self.device)
+        self.model.max_seq_length = 256  # Cap to 256 tokens to prevent quadratic memory spikes
         self.model.eval()
 
     def encode(self, texts: List[str], show_progress_bar: bool = True) -> np.ndarray:
         """
         Encode a list of texts into dense vectors and normalize them for inner-product retrieval.
         """
-        # Encode with bf16 if cuda is available
-        with torch.autocast(device_type=self.device if self.device != 'cpu' else 'cpu', enabled=(self.device == 'cuda')):
-            embeddings = self.model.encode(
-                texts,
-                batch_size=self.batch_size,
-                show_progress_bar=show_progress_bar,
-                convert_to_numpy=True,
-                normalize_embeddings=True # BGE-M3 needs normalization for cosine similarity (equivalent to IP here)
-            )
+        is_cuda = "cuda" in str(self.device)
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda" if is_cuda else "cpu", dtype=torch.float16 if is_cuda else torch.float32, enabled=is_cuda):
+                embeddings = self.model.encode(
+                    texts,
+                    batch_size=self.batch_size,
+                    show_progress_bar=show_progress_bar,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True
+                )
+        if is_cuda:
+            torch.cuda.empty_cache()
         return embeddings
 
 class FaissIndexManager:
