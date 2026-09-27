@@ -25,12 +25,27 @@ def merge_candidate_tables(candidate_dfs: list, e0_features_df: pd.DataFrame = N
     # Standardize column types before concat
     std_dfs = []
     for df in candidate_dfs:
+        if df is None or len(df) == 0:
+            continue
         d = df.copy()
         d['s1_id'] = d['s1_id'].astype(str)
         d['cand_id'] = d['cand_id'].astype(str)
-        d['source'] = d['source'].astype(str)
-        d['blocker'] = d['blocker'].astype(str)
+        if 'source' not in d.columns:
+            d['source'] = d['cand_id'].apply(lambda x: 'S2' if x.startswith('S2') else ('S3' if x.startswith('S3') else 'S2'))
+        else:
+            d['source'] = d['source'].astype(str)
+        if 'blocker' not in d.columns:
+            d['blocker'] = 'unknown'
+        else:
+            d['blocker'] = d['blocker'].astype(str)
+        if 'rank' not in d.columns:
+            d['rank'] = 1
+        if 'score' not in d.columns:
+            d['score'] = 1.0
         std_dfs.append(d)
+        
+    if not std_dfs:
+        return pd.DataFrame()
         
     master_df = pd.concat(std_dfs, ignore_index=True)
     

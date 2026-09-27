@@ -61,6 +61,11 @@ def run_5k_pipeline():
     e0_formatted['rank'] = 1
     e0_formatted['score'] = 1.0 # Pseudo score
     
+    # Determine source for E0 candidates ('S2' or 'S3')
+    e0_formatted['source'] = e0_formatted['cand_id'].astype(str).apply(
+        lambda x: 'S2' if x.startswith('S2') else ('S3' if x.startswith('S3') else 'S2')
+    )
+    
     union_for_expansion = merge_candidate_tables([e0_formatted, structural_cands])
     # melt it back to list
     to_expand = union_for_expansion[['s1_id', 'source', 'cand_id']].copy()
