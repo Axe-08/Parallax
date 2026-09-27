@@ -313,19 +313,21 @@ def run_experiment_arm(
     )
 
     # Cross-script true pair recovery (candidates with Indic characters)
-    # Check predictions for cross-script pairs using the boolean indicator
-    has_indic_col = "has_indicxlit_name" if "has_indicxlit_name" in augmented_df.columns else None
-    if has_indic_col:
-        cs_mask = (augmented_df["target"] == 1) & (augmented_df[has_indic_col] == 1.0)
-    else:
+    cs_recovered = 0
+    if "has_indicxlit_name" in augmented_df.columns:
+        cs_mask = (augmented_df["target"] == 1) & (augmented_df["has_indicxlit_name"] == 1.0)
+        cs_pairs = augmented_df[cs_mask][["s1_id", "cand_id"]]
+        for s1, cand in zip(cs_pairs["s1_id"], cs_pairs["cand_id"], strict=False):
+            if str(cand) in all_oof_preds.get(str(s1), set()):
+                cs_recovered += 1
+    elif "indicxlit_name_similarity" in augmented_df.columns:
         cs_mask = (augmented_df["target"] == 1) & (
             augmented_df["indicxlit_name_similarity"].notna()
         )
-    cs_pairs = augmented_df[cs_mask][["s1_id", "cand_id"]]
-    cs_recovered = 0
-    for s1, cand in zip(cs_pairs["s1_id"], cs_pairs["cand_id"], strict=False):
-        if str(cand) in all_oof_preds.get(str(s1), set()):
-            cs_recovered += 1
+        cs_pairs = augmented_df[cs_mask][["s1_id", "cand_id"]]
+        for s1, cand in zip(cs_pairs["s1_id"], cs_pairs["cand_id"], strict=False):
+            if str(cand) in all_oof_preds.get(str(s1), set()):
+                cs_recovered += 1
 
     # Comparative deltas vs E0
     new_fm = 0
