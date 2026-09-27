@@ -30,7 +30,7 @@ class Reranker:
             )
         return scores
 
-def run_reranking_on_candidates(candidate_df: pd.DataFrame, s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame, serializer_fn) -> pd.DataFrame:
+def run_reranking_on_candidates(candidate_df: pd.DataFrame, s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame, serializer_fn, device: str = None) -> pd.DataFrame:
     """
     Given a candidate union table, generate string pairs and run the cross-encoder.
     """
@@ -68,7 +68,7 @@ def run_reranking_on_candidates(candidate_df: pd.DataFrame, s1_df: pd.DataFrame,
         res['reranker_score'] = 0.0
         return res
         
-    reranker = Reranker()
+    reranker = Reranker(device=device)
     scores = reranker.score_pairs(pairs)
     
     res = candidate_df.copy()

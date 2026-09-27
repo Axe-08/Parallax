@@ -46,7 +46,42 @@ def load_data():
     
     return s1_eval_df, s2_df, s3_df, e0_cands, gt, eval_s1_ids
 
-def run_5k_pipeline():
+def select_best_gpu(requested_gpu: str = "auto") -> str:
+    import torch
+    if not torch.cuda.is_available():
+        print("CUDA not available. Using CPU.")
+        return "cpu"
+        
+    num_devices = torch.cuda.device_count()
+    if requested_gpu != "auto" and requested_gpu != "cpu":
+        gpu_id = int(requested_gpu)
+        print(f"Using explicitly specified GPU: cuda:{gpu_id}")
+        return f"cuda:{gpu_id}"
+        
+    if requested_gpu == "cpu":
+        return "cpu"
+        
+    print(f"Inspecting memory across {num_devices} CUDA devices:")
+    best_device = 0
+    max_free_bytes = -1
+    for i in range(num_devices):
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(i)
+            free_gb = free_bytes / (1024**3)
+            total_gb = total_bytes / (1024**3)
+            print(f"  GPU {i}: {free_gb:.2f} GB free / {total_gb:.2f} GB total")
+            if free_bytes > max_free_bytes:
+                max_free_bytes = free_bytes
+                best_device = i
+        except Exception as e:
+            print(f"  GPU {i}: Error querying memory ({e})")
+            
+    chosen = f"cuda:{best_device}"
+    print(f"--> Automatically selected {chosen} with {max_free_bytes / (1024**3):.2f} GB free VRAM.")
+    return chosen
+
+def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
+    device = select_best_gpu(gpu)
     s1_df, s2_df, s3_df, e0_cands, gt, eval_s1_ids = load_data()
     
     print("1. Running Structural Retrieval (Channel F)...")
@@ -71,8 +106,8 @@ def run_5k_pipeline():
     to_expand = union_for_expansion[['s1_id', 'source', 'cand_id']].copy()
     relational_cands = run_relational_expansion(to_expand, s2_s3_graph)
     
-    print("4. Running Dense Neural Retrieval (BGE-M3)...")
-    retriever = DenseRetriever(batch_size=64)
+    print(f"4. Running Dense Neural Retrieval (BGE-M3 on {device})...")
+    retriever = DenseRetriever(device=device, batch_size=batch_size)
     
     # Pre-serialize
     s1_texts = [serialize_full(row) for _, row in s1_df.iterrows()]
@@ -126,8 +161,8 @@ def run_5k_pipeline():
     print(f"E0 + BGE + E + F Macro F0.5 (Candidate Union Recall Bound): {res.macro_f05:.4f}")
     print(f"Candidate Count: {len(full_union)}")
     
-    print("6. Reranking Full Union...")
-    scored_union = run_reranking_on_candidates(full_union, s1_df, s2_df, s3_df, serialize_full)
+    print(f"6. Reranking Full Union (on {device})...")
+    scored_union = run_reranking_on_candidates(full_union, s1_df, s2_df, s3_df, serialize_full, device=device)
     
     # Filter by reranker score naive threshold for ablation check
     top_reranked = scored_union[scored_union['reranker_score'] > 0.0]
@@ -142,4 +177,9 @@ def run_5k_pipeline():
     print("Pipeline Execution Complete. (This is a skeleton smoke test)")
 
 if __name__ == "__main__":
-    run_5k_pipeline()
+    parser = argparse.ArgumentParser(description="5K Hybrid ER Validation Pipeline")
+    parser.add_argument("--gpu", type=str, default="auto", help="GPU index (e.g. '2') or 'auto' to pick card with most free VRAM")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for embedding")
+    args = parser.parse_args()
+    
+    run_5k_pipeline(gpu=args.gpu, batch_size=args.batch_size)
