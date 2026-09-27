@@ -117,6 +117,7 @@ def main():
         ("TFIDF_Char_3gram", TfidfVectorizer(analyzer="char", ngram_range=(3, 3), sublinear_tf=True), s1_names, tgt_names),
         ("TFIDF_Char_4gram", TfidfVectorizer(analyzer="char", ngram_range=(4, 4), sublinear_tf=True), s1_names, tgt_names),
         ("TFIDF_Token", TfidfVectorizer(analyzer="word", sublinear_tf=True), s1_names, tgt_names),
+        ("Token_Jaccard", CountVectorizer(analyzer="word", binary=True), s1_names, tgt_names),
         ("Vowel_Stripped_3gram", TfidfVectorizer(analyzer="char", ngram_range=(3, 3), sublinear_tf=True), s1_vowel, tgt_vowel),
         ("Consonant_Skel_3gram", TfidfVectorizer(analyzer="char", ngram_range=(3, 3), sublinear_tf=True), s1_cons, tgt_cons),
     ]
@@ -126,7 +127,6 @@ def main():
     results_all = {name: [] for name, _, _, _ in reps}
     results_indic = {name: [] for name, _, _, _ in reps}
     
-    # Extra reps for fuzzy
     results_all["Jaro_Winkler"] = []
     results_indic["Jaro_Winkler"] = []
     results_all["Token_Sort_Ratio"] = []
@@ -134,19 +134,28 @@ def main():
     results_all["Ensemble_Max"] = []
     results_indic["Ensemble_Max"] = []
 
-    # Prepare vectors
     vec_models = {}
     for name, vec, s1_src, tgt_src in reps:
         tgt_mat = vec.fit_transform(tgt_src)
         s1_mat = vec.transform(s1_src)
-        vec_models[name] = (s1_mat, tgt_mat.T)
-        
-    for i, s1_id in enumerate(tqdm(s1_ids, desc="Querying S1 BFNs")):
-        # Target scores for this specific S1 query across all representations
-        scores_dict = {}
-        for name, (s1_mat, tgt_mat_T) in vec_models.items():
-            scores_dict[name] = s1_mat[i].dot(tgt_mat_T).toarray()[0]
+        if name == "Token_Jaccard":
+            tgt_sum = np.array(tgt_mat.sum(axis=1)).flatten()
+            vec_models[name] = (s1_mat, tgt_mat.T, tgt_sum)
+        else:
+            vec_models[name] = (s1_mat, tgt_mat.T, None)
             
+    for i, s1_id in enumerate(tqdm(s1_ids, desc="Querying S1 BFNs")):
+        scores_dict = {}
+        for name, (s1_mat, tgt_mat_T, tgt_sum) in vec_models.items():
+            intersection = s1_mat[i].dot(tgt_mat_T).toarray()[0]
+            if name == "Token_Jaccard":
+                s1_sum = s1_mat[i].sum()
+                union = s1_sum + tgt_sum - intersection
+                union[union == 0] = 1
+                scores_dict[name] = intersection / union
+            else:
+                scores_dict[name] = intersection
+                
         jw_scores = process.cdist([s1_names[i]], tgt_names, scorer=JaroWinkler.normalized_similarity)[0]
         ts_scores = process.cdist([s1_names[i]], tgt_names, scorer=fuzz.token_sort_ratio)[0] / 100.0
         
@@ -165,43 +174,49 @@ def main():
             for rep_name, scores in scores_dict.items():
                 sim = scores[tgt_i]
                 
-                # Universe 1: ALL Indian targets
                 best_all, worst_all, eq_all = get_rank_stats(scores, sim)
                 results_all[rep_name].append((sim, best_all, worst_all, eq_all))
                 
-                # Universe 2: Indic-script-only targets
                 indic_scores = scores[tgt_is_indic]
                 best_ind, worst_ind, eq_ind = get_rank_stats(indic_scores, sim)
                 results_indic[rep_name].append((sim, best_ind, worst_ind, eq_ind))
 
     def print_report(results, universe_name):
-        print(f"\n=========================================================================")
+        print(f"\n=========================================================================================================")
         print(f" {universe_name} UNIVERSE DIAGNOSTIC")
-        print(f"=========================================================================")
-        header = f"{'Representation':<22} | {'Med Sim':<7} | {'Z-Score':<7} | {'Med Rank':<9} | {'R@1':<6} | {'R@5':<6} | {'R@10':<6} | {'R@20':<6} | {'R@100':<6}"
+        print(f"=========================================================================================================")
+        header = f"{'Representation':<22} | {'Med Sim':<7} | {'Zero-Count':<10} | {'Med Best':<8} | {'Med Worst':<9} | {'R@1 (B/W)':<11} | {'R@5 (B/W)':<11} | {'R@10 (B/W)':<12} | {'R@20 (B/W)':<12} | {'R@100 (B/W)':<12}"
         print(header)
         print("-" * len(header))
         
         for name in results_all.keys():
             res = results[name]
             sims = np.array([x[0] for x in res])
-            # For recall, strictly we use worst_rank to be robust against ties.
-            worst_ranks = np.array([x[2] for x in res])
             best_ranks = np.array([x[1] for x in res])
+            worst_ranks = np.array([x[2] for x in res])
             
             med_sim = np.median(sims)
-            z_score = np.sum(sims == 0.0)
+            zero_count = np.sum(sims == 0.0)
             
-            # Using worst rank for conservative recall
-            med_worst_rank = np.median(worst_ranks)
+            med_best = np.median(best_ranks)
+            med_worst = np.median(worst_ranks)
             
-            r1 = np.mean(worst_ranks <= 1) * 100
-            r5 = np.mean(worst_ranks <= 5) * 100
-            r10 = np.mean(worst_ranks <= 10) * 100
-            r20 = np.mean(worst_ranks <= 20) * 100
-            r100 = np.mean(worst_ranks <= 100) * 100
+            r1_b = np.mean(best_ranks <= 1) * 100
+            r1_w = np.mean(worst_ranks <= 1) * 100
             
-            print(f"{name:<22} | {med_sim:<7.3f} | {z_score:<7d} | {med_worst_rank:<9.0f} | {r1:<5.1f}% | {r5:<5.1f}% | {r10:<5.1f}% | {r20:<5.1f}% | {r100:<5.1f}%")
+            r5_b = np.mean(best_ranks <= 5) * 100
+            r5_w = np.mean(worst_ranks <= 5) * 100
+            
+            r10_b = np.mean(best_ranks <= 10) * 100
+            r10_w = np.mean(worst_ranks <= 10) * 100
+            
+            r20_b = np.mean(best_ranks <= 20) * 100
+            r20_w = np.mean(worst_ranks <= 20) * 100
+            
+            r100_b = np.mean(best_ranks <= 100) * 100
+            r100_w = np.mean(worst_ranks <= 100) * 100
+            
+            print(f"{name:<22} | {med_sim:<7.3f} | {zero_count:<10d} | {med_best:<8.0f} | {med_worst:<9.0f} | {r1_b:>4.1f}/{r1_w:<4.1f} | {r5_b:>4.1f}/{r5_w:<4.1f} | {r10_b:>4.1f}/{r10_w:<4.1f} | {r20_b:>4.1f}/{r20_w:<4.1f} | {r100_b:>4.1f}/{r100_w:<4.1f}")
 
     print_report(results_all, "FULL TARGET")
     print_report(results_indic, "INDIC-SCRIPT GATED")
