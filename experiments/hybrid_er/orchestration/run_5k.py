@@ -1,214 +1,262 @@
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+"""
+5K hybrid ER validation run (P0 contract smoke + candidate ablations + E0 matcher).
 
-import sys
-import time
+    global GT (full split)  -> global contract validation
+                            -> scope to the 5K evaluation S1s -> GT_eval
+    candidate channels      -> strict union boundary (schema, source, population)
+                            -> candidate-level metrics only (recall, BFN, cost)
+    E0 LightGBM matcher     -> deterministic grouped outer/inner-OOF protocol
+                            -> predictions ⊆ E0 candidates -> trusted Macro F0.5
+
+Candidate pools are never scored as if they were matcher predictions.
+
+Usage (from the project root):
+    python experiments/hybrid_er/orchestration/run_5k.py
+    python experiments/hybrid_er/orchestration/run_5k.py --with-dense --gpu auto   # DGX only
+"""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
-import pandas as pd
-import numpy as np
-import torch
+import logging
+import sys
+from itertools import combinations
 from pathlib import Path
 
-# Add project root to sys path
+import numpy as np
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+for p in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
-from parallax.data.contracts import load_ground_truth_dict
-
-# Internal imports
-from experiments.hybrid_er.core.validation import (
-    validate_candidate_schema, validate_source_contract, 
-    validate_evaluation_population, validate_gt_global_contract,
-    scope_ground_truth_to_eval
+from experiments.hybrid_er.core.data import SplitData, load_split  # noqa: E402
+from experiments.hybrid_er.core.runtime import RunRecorder, select_device  # noqa: E402
+from experiments.hybrid_er.core.validation import (  # noqa: E402
+    assign_source_by_membership,
+    scope_ground_truth_to_eval,
+    validate_evaluation_population,
 )
-from experiments.hybrid_er.evaluation.metrics import evaluate_candidate_recall, evaluate_matcher_predictions
-from experiments.hybrid_er.core.serialization import serialize_full, serialize_name_only, serialize_address_only
-from experiments.hybrid_er.retrieval.neural_bge import DenseRetriever, FaissIndexManager
-from experiments.hybrid_er.retrieval.structural import run_structural_retrieval
-from experiments.hybrid_er.retrieval.relational import build_s2_s3_graph, run_relational_expansion
-from experiments.hybrid_er.retrieval.union import merge_candidate_tables
-from experiments.hybrid_er.models.reranker import run_reranking_on_candidates
-from experiments.hybrid_er.models.meta_blocker import train_meta_blocker, filter_top_m
-from experiments.hybrid_er.models.fusion import train_fusion_model, predict_fusion, build_fusion_features
-from experiments.hybrid_er.training.hard_negatives import mine_hard_negatives
+from experiments.hybrid_er.evaluation.matcher_harness import (  # noqa: E402
+    BASELINE_LGBM_PARAMS,
+    BASELINE_NUM_BOOST_ROUND,
+    BASELINE_THRESHOLD_GRID,
+    label_pairs,
+    run_grouped_matcher,
+)
+from experiments.hybrid_er.evaluation.metrics import (  # noqa: E402
+    evaluate_candidate_recall,
+    evaluate_matcher_predictions,
+)
+from experiments.hybrid_er.retrieval.relational import build_s2_s3_graph, run_relational_expansion  # noqa: E402
+from experiments.hybrid_er.retrieval.structural import run_structural_retrieval  # noqa: E402
+from experiments.hybrid_er.retrieval.union import candidates_to_dict, merge_candidate_tables  # noqa: E402
 
-def load_data():
-    print("Loading 5K Data...")
-    gt = load_ground_truth_dict("data/medium_split_200k/train_ground_truth.tsv")
-    
-    # We only have the sample files for 5K in baseline_artifacts
-    s1_df = pd.read_parquet('baseline_artifacts/features_sample.parquet')
-    eval_s1_ids = list(s1_df['s1_id'].astype(str).unique())
-    
-    # We load the full targets because retrieval acts on all targets
-    s2_df = pd.read_csv('data/medium_split_200k/train_source2.tsv', sep='\t')
-    s3_df = pd.read_csv('data/medium_split_200k/train_source3.tsv', sep='\t')
-    
-    # We also load the actual S1 string representations
-    full_s1 = pd.read_csv('data/medium_split_200k/train_source1.tsv', sep='\t')
-    s1_eval_df = full_s1[full_s1['entity_id'].astype(str).isin(eval_s1_ids)].copy()
-    
-    # Load E0 baseline candidate pairs
-    e0_cands = pd.read_parquet('baseline_artifacts/candidate_pairs_sample.parquet')
-    
-    return s1_eval_df, s2_df, s3_df, e0_cands, gt, eval_s1_ids
+logger = logging.getLogger("run_5k")
 
-def select_best_gpu(requested_gpu: str = "auto") -> str:
-    import torch
-    if not torch.cuda.is_available():
-        print("CUDA not available. Using CPU.")
-        return "cpu"
-        
-    num_devices = torch.cuda.device_count()
-    if requested_gpu != "auto" and requested_gpu != "cpu":
-        gpu_id = int(requested_gpu)
-        print(f"Using explicitly specified GPU: cuda:{gpu_id}")
-        return f"cuda:{gpu_id}"
-        
-    if requested_gpu == "cpu":
-        return "cpu"
-        
-    print(f"Inspecting memory across {num_devices} CUDA devices:")
-    best_device = 0
-    max_free_bytes = -1
-    for i in range(num_devices):
-        try:
-            free_bytes, total_bytes = torch.cuda.mem_get_info(i)
-            free_gb = free_bytes / (1024**3)
-            total_gb = total_bytes / (1024**3)
-            print(f"  GPU {i}: {free_gb:.2f} GB free / {total_gb:.2f} GB total")
-            if free_bytes > max_free_bytes:
-                max_free_bytes = free_bytes
-                best_device = i
-        except Exception as e:
-            print(f"  GPU {i}: Error querying memory ({e})")
-            
-    chosen = f"cuda:{best_device}"
-    print(f"--> Automatically selected {chosen} with {max_free_bytes / (1024**3):.2f} GB free VRAM.")
-    return chosen
+# Frozen baseline feature list (tag parallax-experimental-baseline-v1).
+BASELINE_28_FEATURES: list[str] = [
+    "raw_name_ratio", "soft_name_ratio", "token_sort_ratio", "token_set_ratio", "partial_ratio",
+    "addr_token_set_ratio", "addr_ratio", "num_match_score", "is_s1_addr_null", "is_cand_addr_null",
+    "both_addr_present", "len_diff_name", "len_ratio_name", "primary_num_match", "primary_num_conflict",
+    "primary_num_missing", "num_jaccard", "num_conflict_count", "postal_match", "postal_conflict",
+    "postal_missing", "jaro_winkler_soft", "jaro_winkler_raw", "token_jaccard_name", "token_overlap_name",
+    "first_token_match", "canon_addr_ratio", "token_jaccard_addr",
+]
 
-def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
-    device = select_best_gpu(gpu)
-    s1_df, s2_df, s3_df, e0_cands, gt, eval_s1_ids = load_data()
-    
-    s2_ids = set(s2_df['entity_id'].astype(str))
-    s3_ids = set(s3_df['entity_id'].astype(str))
-    
-    validate_evaluation_population(s1_df, eval_s1_ids)
-    validate_gt_global_contract(gt, s2_ids, s3_ids)
-    gt_eval = scope_ground_truth_to_eval(gt, eval_s1_ids)
-    
-    print("1. Running Structural Retrieval (Channel F)...")
-    structural_cands = run_structural_retrieval(s1_df, s2_df, s3_df)
-    
-    print("2. Building Relational Graph (Channel E)...")
-    s2_s3_graph = build_s2_s3_graph(s2_df, s3_df)
-    print("3. Running Relational Expansion...")
-    # Expand E0 and Structural candidates
-    e0_formatted = e0_cands.copy()
-    e0_formatted['blocker'] = 'e0'
-    e0_formatted['rank'] = 1
-    e0_formatted['score'] = 1.0 # Pseudo score
-    
-    # Authoritative source assignment for E0 based strictly on ID membership
-    def get_source(cid):
-        if cid in s2_ids: return 'S2'
-        if cid in s3_ids: return 'S3'
-        raise ValueError(f"Candidate ID {cid} not found in S2 or S3")
-        
-    e0_formatted['source'] = e0_formatted['cand_id'].astype(str).apply(get_source)
-    
-    validate_candidate_schema(e0_formatted)
-    validate_source_contract(e0_formatted, s2_ids, s3_ids)
-    
-    union_for_expansion = merge_candidate_tables([e0_formatted, structural_cands], s2_ids=s2_ids, s3_ids=s3_ids)
-    # melt it back to list
-    to_expand = union_for_expansion[['s1_id', 'source', 'cand_id']].copy()
-    relational_cands = run_relational_expansion(to_expand, s2_s3_graph)
-    
-    print(f"4. Running Dense Neural Retrieval (BGE-M3 on {device})...")
+
+def load_e0_channel(path: Path, data: SplitData, eval_s1_ids: list[str]) -> pd.DataFrame:
+    """E0 candidate pool with authoritative (membership-derived) source. E0 rank/score are not
+    stored in the frozen artifact, so they are left missing rather than fabricated."""
+    e0 = pd.read_parquet(path)[["s1_id", "cand_id"]]
+    validate_evaluation_population(e0, eval_s1_ids)
+    e0 = assign_source_by_membership(e0, data.s2_ids, data.s3_ids)
+    e0["s1_id"] = e0["s1_id"].astype(str)
+    e0["blocker"] = "e0"
+    e0["rank"] = np.nan
+    e0["score"] = np.nan
+    return e0
+
+
+def run_dense_channel(s1_df: pd.DataFrame, data: SplitData, device: str, batch_size: int, k: int) -> pd.DataFrame:
+    """Zero-shot BGE-M3 (recall-only reference; the supervised retriever is Phase 2)."""
+    from experiments.hybrid_er.core.serialization import serialize_full
+    from experiments.hybrid_er.retrieval.neural_bge import DenseRetriever, FaissIndexManager
+
     retriever = DenseRetriever(device=device, batch_size=batch_size)
-    
-    # Pre-serialize
-    s1_texts = [serialize_full(row) for _, row in s1_df.iterrows()]
-    s2_texts = [serialize_full(row) for _, row in s2_df.iterrows()]
-    s3_texts = [serialize_full(row) for _, row in s3_df.iterrows()]
-    
-    s1_embs = retriever.encode(s1_texts)
-    s2_embs = retriever.encode(s2_texts)
-    s3_embs = retriever.encode(s3_texts)
-    
-    # Build FAISS
-    index_s2 = FaissIndexManager(1024, "FlatIP")
-    index_s2.add(s2_embs, [str(x) for x in s2_df['entity_id']])
-    
-    index_s3 = FaissIndexManager(1024, "FlatIP")
-    index_s3.add(s3_embs, [str(x) for x in s3_df['entity_id']])
-    
-    # Search
-    d_s2, _, e_s2 = index_s2.search(s1_embs, k=50)
-    d_s3, _, e_s3 = index_s3.search(s1_embs, k=50)
-    
-    neural_cands = []
-    for i, s1_row in enumerate(s1_df.itertuples()):
-        s1_id = str(s1_row.entity_id)
-        
-        for rank, (score, cand) in enumerate(zip(d_s2[i], e_s2[i])):
-            if cand:
-                neural_cands.append({'s1_id': s1_id, 'source': 'S2', 'cand_id': cand, 'blocker': 'bge_dense', 'rank': rank+1, 'score': score})
-                
-        for rank, (score, cand) in enumerate(zip(d_s3[i], e_s3[i])):
-            if cand:
-                neural_cands.append({'s1_id': s1_id, 'source': 'S3', 'cand_id': cand, 'blocker': 'bge_dense', 'rank': rank+1, 'score': score})
-                
-    neural_cands_df = pd.DataFrame(neural_cands)
-    if not neural_cands_df.empty:
-        validate_candidate_schema(neural_cands_df)
-        validate_source_contract(neural_cands_df, s2_ids, s3_ids)
-    
-    print("\n5. Evaluating Ablation Matrix...")
-    # E0 is baseline
-    e0_preds = {s: set(e0_cands[e0_cands['s1_id'] == s]['cand_id'].astype(str)) for s in eval_s1_ids}
-    print("--- E0 Baseline ---")
-    print(evaluate_candidate_recall(gt_eval, e0_preds, eval_s1_ids))
-    e0_eval = evaluate_matcher_predictions(gt_eval, e0_preds, eval_s1_ids)
-    print(f"Matcher Macro F0.5: {e0_eval.macro_f05:.4f}\n")
-    
-    # E0 + BGE
-    e0_bge = merge_candidate_tables([e0_formatted, neural_cands_df], s2_ids=s2_ids, s3_ids=s3_ids)
-    preds_bge = e0_bge.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
-    print("--- E0 + BGE ---")
-    print(evaluate_candidate_recall(gt_eval, preds_bge, eval_s1_ids))
-    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt_eval, preds_bge, eval_s1_ids).macro_f05:.4f}\n")
-    
-    # Full Union (E0 + BGE + E + F)
-    full_union = merge_candidate_tables([e0_formatted, neural_cands_df, structural_cands, relational_cands], s2_ids=s2_ids, s3_ids=s3_ids)
-    preds_full = full_union.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
-    print("--- E0 + BGE + E + F (FULL UNION) ---")
-    print(evaluate_candidate_recall(gt_eval, preds_full, eval_s1_ids))
-    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt_eval, preds_full, eval_s1_ids).macro_f05:.4f}\n")
-    
-    print(f"6. Reranking Full Union (on {device})...")
-    scored_union = run_reranking_on_candidates(full_union, s1_df, s2_df, s3_df, serialize_full, device=device)
-    
-    # Filter by reranker score naive threshold for ablation check
-    top_reranked = scored_union[scored_union['reranker_score'] > 0.0]
-    preds_reranked = top_reranked.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
-    print("--- + Reranker (Naive > 0) ---")
-    print(evaluate_candidate_recall(gt_eval, preds_reranked, eval_s1_ids))
-    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt_eval, preds_reranked, eval_s1_ids).macro_f05:.4f}\n")
-    
-    print("7. Meta-Blocker Compression Evaluation...")
-    # Train dummy meta-blocker (now using is_match correctly via GT later)
-    meta_model = train_meta_blocker(scored_union, target_col='found_by_e0') # Just a dummy target for now, real one uses GT
-    
-    print("Pipeline Execution Complete. (This is a skeleton smoke test)")
+    s1_embs = retriever.encode([serialize_full(r) for r in s1_df.to_dict("records")])
+    rows = []
+    s1_ids = s1_df["entity_id"].tolist()
+    for source, tgt_df in (("S2", data.s2), ("S3", data.s3)):
+        index = FaissIndexManager(1024, "FlatIP")
+        index.add(retriever.encode([serialize_full(r) for r in tgt_df.to_dict("records")]), tgt_df["entity_id"].tolist())
+        dist, _, ents = index.search(s1_embs, k=k)
+        for i, s1 in enumerate(s1_ids):
+            for rank, (score, cand) in enumerate(zip(dist[i], ents[i]), start=1):
+                if cand is not None:
+                    rows.append((s1, source, cand, "bge_full_zeroshot", rank, float(score)))
+    return pd.DataFrame(rows, columns=["s1_id", "source", "cand_id", "blocker", "rank", "score"])
+
+
+def contract_negative_checks(e0: pd.DataFrame, data: SplitData, gt_eval: dict[str, set[str]], eval_ids: list[str]) -> dict[str, bool]:
+    """Proves the contracts fail loudly on corrupted inputs (each must raise ValueError)."""
+    s3_example = next(iter(sorted(data.s3_ids)))
+    s1_example = next(iter(sorted(data.s1_ids - set(eval_ids))))
+    cases = {}
+
+    bad = e0.head(3).copy()
+    bad.loc[bad.index[0], "cand_id"] = s3_example  # S3 id labeled S2 (or S2 id relabeled)
+    bad.loc[bad.index[0], "source"] = "S2"
+    cases["mislabeled_source_rejected_at_union"] = lambda: merge_candidate_tables([bad], s2_ids=data.s2_ids, s3_ids=data.s3_ids)
+
+    unk = e0.head(3).copy()
+    unk.loc[unk.index[0], "cand_id"] = "S9-000"
+    cases["unknown_candidate_id_rejected"] = lambda: assign_source_by_membership(unk, data.s2_ids, data.s3_ids)
+
+    dup = pd.concat([e0.head(2), e0.head(1)])
+    cases["duplicate_within_blocker_rejected"] = lambda: merge_candidate_tables([dup], s2_ids=data.s2_ids, s3_ids=data.s3_ids)
+
+    cases["extra_s1_in_predictions_rejected"] = lambda: evaluate_matcher_predictions(gt_eval, {s1_example: set()}, eval_ids)
+
+    cands = candidates_to_dict(e0, eval_ids)
+    s1_first = eval_ids[0]
+    cases["prediction_outside_candidates_rejected"] = lambda: evaluate_matcher_predictions(
+        gt_eval, {s1_first: {s3_example}}, eval_ids, candidates=cands
+    )
+
+    cases["eval_s1_missing_from_gt_rejected"] = lambda: scope_ground_truth_to_eval({}, eval_ids[:1])
+
+    results = {}
+    for name, fn in cases.items():
+        try:
+            fn()
+            results[name] = False
+        except ValueError:
+            results[name] = True
+    return results
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="5K Hybrid ER validation run")
+    parser.add_argument("--split-dir", type=Path, default=PROJECT_ROOT / "data/medium_split_200k")
+    parser.add_argument("--e0-candidates", type=Path, default=PROJECT_ROOT / "baseline_artifacts/candidate_pairs_sample.parquet")
+    parser.add_argument(
+        "--e0-features",
+        type=Path,
+        default=PROJECT_ROOT / "experiments/neural_text/caches/augmented_features_with_concordance_5k.parquet",
+    )
+    parser.add_argument("--cv-folds", type=Path, default=PROJECT_ROOT / "data/medium_split_200k/cv_folds_source1.tsv")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Inner-split/LightGBM seeds for the matcher")
+    parser.add_argument("--with-dense", action="store_true", help="Add zero-shot BGE-M3 channel (GPU)")
+    parser.add_argument("--dense-k", type=int, default=50)
+    parser.add_argument("--gpu", type=str, default="auto")
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--out-dir", type=Path, default=PROJECT_ROOT / "artifacts/hybrid_er")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    device = select_device(args.gpu) if args.with_dense else "cpu"
+    rec = RunRecorder(
+        "run_5k",
+        args.out_dir,
+        config={k: str(v) for k, v in vars(args).items()}
+        | {"lgbm_params": BASELINE_LGBM_PARAMS, "num_boost_round": BASELINE_NUM_BOOST_ROUND,
+           "threshold_grid": list(BASELINE_THRESHOLD_GRID), "features": BASELINE_28_FEATURES},
+        device=device,
+    )
+
+    # 1. Global population + global GT contract.
+    with rec.stage("load_split"):
+        data = load_split(args.split_dir)
+    rec.put("population_global", data.counts())
+
+    # 2. Evaluation population and GT scoping.
+    feats = pd.read_parquet(args.e0_features)
+    eval_s1_ids = sorted(feats["s1_id"].astype(str).unique())
+    not_in_split = set(eval_s1_ids) - data.s1_ids
+    if not_in_split:
+        raise ValueError(f"{len(not_in_split)} evaluation S1s are not in the split's S1 population.")
+    gt_eval = scope_ground_truth_to_eval(data.gt, eval_s1_ids)
+    s1_eval_df = data.s1[data.s1["entity_id"].isin(set(eval_s1_ids))].reset_index(drop=True)
+    validate_evaluation_population(s1_eval_df, eval_s1_ids)
+    rec.put(
+        "population_eval",
+        {"s1": len(eval_s1_ids), "gt_pairs": sum(len(v) for v in gt_eval.values()),
+         "zero_match_s1": sum(1 for v in gt_eval.values() if not v)},
+    )
+
+    # 3. Candidate channels (each validated at the union boundary).
+    channels: dict[str, pd.DataFrame] = {}
+    with rec.stage("channel_e0"):
+        channels["E0"] = load_e0_channel(args.e0_candidates, data, eval_s1_ids)
+    with rec.stage("channel_f_structural"):
+        channels["F"] = run_structural_retrieval(s1_eval_df, data.s2, data.s3)
+    with rec.stage("channel_e_relational"):
+        graph = build_s2_s3_graph(data.s2, data.s3)
+        seeds = merge_candidate_tables([channels["E0"], channels["F"]], s2_ids=data.s2_ids, s3_ids=data.s3_ids)
+        channels["E"] = run_relational_expansion(seeds[["s1_id", "source", "cand_id"]], graph)
+    if args.with_dense:
+        with rec.stage("channel_bge_zeroshot"):
+            channels["BGE0"] = run_dense_channel(s1_eval_df, data, device, args.batch_size, args.dense_k)
+
+    # 4. Candidate-level ablations (E0 always included).
+    candidate_reports = {}
+    extras = [c for c in channels if c != "E0"]
+    for r in range(len(extras) + 1):
+        for combo in combinations(extras, r):
+            name = "+".join(("E0", *combo))
+            union = merge_candidate_tables([channels[c] for c in ("E0", *combo)], s2_ids=data.s2_ids, s3_ids=data.s3_ids)
+            report = evaluate_candidate_recall(gt_eval, candidates_to_dict(union, eval_s1_ids), eval_s1_ids)
+            candidate_reports[name] = report.to_dict()
+            logger.info("--- %s ---\n%s", name, report)
+    for c in extras:
+        solo = merge_candidate_tables([channels[c]], s2_ids=data.s2_ids, s3_ids=data.s3_ids)
+        candidate_reports[f"{c}_only"] = evaluate_candidate_recall(
+            gt_eval, candidates_to_dict(solo, eval_s1_ids), eval_s1_ids
+        ).to_dict()
+    rec.put("candidate_generation", candidate_reports)
+
+    # 5. E0 matcher (real predictions, never the candidate pool).
+    e0_cands = candidates_to_dict(channels["E0"], eval_s1_ids)
+    feat_pairs = set(zip(feats["s1_id"].astype(str), feats["cand_id"].astype(str)))
+    pool_pairs = {(s, c) for s, cs in e0_cands.items() for c in cs}
+    if feat_pairs != pool_pairs:
+        raise ValueError("E0 feature rows do not match the E0 candidate pool exactly.")
+    if "target" in feats.columns and not np.array_equal(label_pairs(feats, gt_eval), feats["target"].astype(np.int8).to_numpy()):
+        raise ValueError("Stored 'target' column disagrees with GT-derived labels.")
+
+    folds_df = pd.read_csv(args.cv_folds, sep="\t", dtype={"entity_id": str})
+    s1_to_fold = dict(zip(folds_df["entity_id"], folds_df["fold"].astype(int)))
+
+    matcher_runs = []
+    for seed in args.seeds:
+        with rec.stage(f"e0_matcher_seed{seed}"):
+            run = run_grouped_matcher(feats, BASELINE_28_FEATURES, gt_eval, s1_to_fold, seed=seed)
+        report = evaluate_matcher_predictions(
+            gt_eval, run.predictions, eval_s1_ids, candidates=e0_cands, s2_ids=data.s2_ids, s3_ids=data.s3_ids
+        )
+        logger.info("--- E0 LightGBM matcher (seed %d, taus %s) ---\n%s", seed, run.taus, report)
+        matcher_runs.append({"seed": seed, "taus": run.taus, "folds": [vars(f) for f in run.folds]} | report.to_dict())
+    f05 = [m["macro_f05"] for m in matcher_runs]
+    rec.put(
+        "matcher_e0",
+        {"runs": matcher_runs, "macro_f05_mean": float(np.mean(f05)), "macro_f05_std": float(np.std(f05)),
+         "macro_f05_min": float(np.min(f05)), "macro_f05_max": float(np.max(f05))},
+    )
+
+    # 6. Contract negative controls.
+    checks = contract_negative_checks(channels["E0"], data, gt_eval, eval_s1_ids)
+    rec.put("contract_negative_checks", checks)
+    if not all(checks.values()):
+        raise AssertionError(f"Contract negative checks failed: {checks}")
+
+    path = rec.save()
+    logger.info("Run record written to %s", path)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="5K Hybrid ER Validation Pipeline")
-    parser.add_argument("--gpu", type=str, default="auto", help="GPU index (e.g. '2') or 'auto' to pick card with most free VRAM")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for embedding")
-    args = parser.parse_args()
-    
-    run_5k_pipeline(gpu=args.gpu, batch_size=args.batch_size)
+    main()

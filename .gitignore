@@ -72,3 +72,10 @@ aws_credentials.json
 .agents/
 .claude/
 skills-lock.json
+
+# Hybrid ER experiment artifacts: track small run summaries (json/md) only.
+# Embeddings, FAISS indexes, checkpoints and candidate tables stay local/DGX-side.
+artifacts/**
+!artifacts/**/
+!artifacts/**/*.json
+!artifacts/**/*.md

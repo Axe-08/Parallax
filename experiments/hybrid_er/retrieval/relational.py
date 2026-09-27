@@ -56,27 +56,26 @@ def run_relational_expansion(initial_candidates_df: pd.DataFrame, adj_graph: Dic
     Takes an initial set of candidates (e.g. from E0 or BGE) and performs a 1-hop expansion
     using the target-target graph.
     """
+    empty = pd.DataFrame(columns=['s1_id', 'source', 'cand_id', 'blocker', 'rank', 'score'])
     if initial_candidates_df.empty:
-        return pd.DataFrame()
-        
+        return empty
+
     expanded = []
-    
-    for _, row in initial_candidates_df.iterrows():
-        s1 = str(row['s1_id'])
-        source = str(row['source'])
-        tgt = str(row['cand_id'])
-        
-        node_key = f"{source}:{tgt}"
-        
-        if node_key in adj_graph:
-            for exp_source, exp_tgt in adj_graph[node_key]:
-                expanded.append({
-                    's1_id': s1,
-                    'source': exp_source,
-                    'cand_id': exp_tgt,
-                    'blocker': 'channel_e_graph',
-                    'rank': 1,
-                    'score': 1.0 # Edge weight
-                })
-                
-    return pd.DataFrame(expanded) if expanded else pd.DataFrame(columns=['s1_id', 'source', 'cand_id', 'blocker', 'rank', 'score'])
+    for s1, source, tgt in zip(
+        initial_candidates_df['s1_id'].astype(str),
+        initial_candidates_df['source'].astype(str),
+        initial_candidates_df['cand_id'].astype(str),
+    ):
+        for exp_source, exp_tgt in adj_graph.get(f"{source}:{tgt}", ()):
+            expanded.append((s1, exp_source, exp_tgt))
+
+    if not expanded:
+        return empty
+
+    # One row per canonical candidate; score = number of seed candidates that reach it.
+    df = pd.DataFrame(expanded, columns=['s1_id', 'source', 'cand_id'])
+    df = df.groupby(['s1_id', 'source', 'cand_id'], sort=False).size().rename('score').reset_index()
+    df['score'] = df['score'].astype(float)
+    df['blocker'] = 'channel_e_graph'
+    df['rank'] = df.groupby('s1_id')['score'].rank(ascending=False, method='min')
+    return df[['s1_id', 'source', 'cand_id', 'blocker', 'rank', 'score']]

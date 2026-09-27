@@ -40,6 +40,6 @@ warn_unused_configs = true
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
+pythonpath = ["src", "."]
+testpaths = ["tests", "experiments/hybrid_er/tests"]
 python_files = ["test_*.py"]
