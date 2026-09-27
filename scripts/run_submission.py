@@ -175,6 +175,154 @@ def stage_prepare(args: argparse.Namespace) -> None:
     log(f"Saved {feat_path}")
 
 
+# --------------------------------------------------------------------------- features (lean)
+# Fork-shared state holds only Arrow tables and numpy arrays (no per-row Python objects),
+# so reading it in workers never dirties/copies parent pages (avoids fork+THP COW blowup).
+_LEAN: dict[str, object] = {}
+
+
+def _fixed_bytes_ids(col: object) -> np.ndarray:
+    import pyarrow as pa
+
+    assert isinstance(col, pa.ChunkedArray)
+    obj = col.to_numpy(zero_copy_only=False)
+    width = max(1, max((len(x) for x in obj), default=1))
+    out = np.asarray(obj, dtype=f"S{width + 2}")
+    del obj
+    return out
+
+
+def _lean_take(prefix: str, ids: np.ndarray) -> pd.DataFrame:
+    import pyarrow as pa
+
+    keys = _LEAN[f"{prefix}_keys"]
+    order = _LEAN[f"{prefix}_order"]
+    table = _LEAN[f"{prefix}_tab"]
+    assert isinstance(keys, np.ndarray) and isinstance(order, np.ndarray)
+    assert isinstance(table, pa.Table)
+    q = ids.astype(keys.dtype)
+    pos = np.clip(np.searchsorted(keys, q), 0, len(keys) - 1)
+    ok = keys[pos] == q
+    rows = np.sort(order[pos[ok]])
+    return table.take(pa.array(rows)).to_pandas()
+
+
+def _lean_feature_task(i: int) -> int:
+    import pyarrow as pa
+
+    out_dir = Path(str(_LEAN["out_dir"]))
+    out = out_dir / f"part_{i:05d}.parquet"
+    if out.is_file():
+        return -1
+    bounds = _LEAN["bounds"]
+    cands = _LEAN["cands"]
+    assert isinstance(bounds, list) and isinstance(cands, pa.Table)
+    a, b = bounds[i]
+    part = cands.slice(a, b - a).to_pandas()
+    candidates: dict[str, dict[str, float]] = {}
+    for s, c, sim in zip(
+        part["s1_id"].to_numpy(),
+        part["cand_id"].to_numpy(),
+        part["blocking_sim"].to_numpy(),
+        strict=False,
+    ):
+        d = candidates.get(s)
+        if d is None:
+            d = candidates[s] = {}
+        d[c] = float(sim)
+    s1_df = _lean_take("s1", np.asarray(list(candidates.keys()), dtype=object))
+    tgt_df = _lean_take("tgt", part["cand_id"].unique())
+    ex = PairwiseFeatureExtractor()
+    feats = ex._extract_features_serial(
+        candidates,
+        s1_dict=ex.build_record_lookup(s1_df),
+        target_dict=ex.build_record_lookup(tgt_df),
+        ground_truth=None,
+        show_progress=False,
+    )
+    tmp = out.with_suffix(".tmp")
+    feats.to_parquet(tmp, index=False)
+    tmp.rename(out)
+    return len(feats)
+
+
+def stage_features(args: argparse.Namespace) -> None:
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from parallax.utils.parallel import run_pool
+
+    work = Path(args.work_dir)
+    out_dir = work / "feat_parts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    cands = pq.read_table(work / "test_candidates.parquet").combine_chunks()
+    cands = cands.sort_by("s1_id").combine_chunks()
+    s1_col = cands["s1_id"]
+    change = pc.not_equal(s1_col.slice(1), s1_col.slice(0, len(s1_col) - 1))
+    starts = np.concatenate([[0], np.flatnonzero(change.to_numpy(zero_copy_only=False)) + 1])
+    n = len(cands)
+    bounds: list[tuple[int, int]] = []
+    a = 0
+    for cut in range(args.part_pairs, n, args.part_pairs):
+        j = int(np.searchsorted(starts, cut))
+        b = int(starts[j]) if j < len(starts) else n
+        if b > a:
+            bounds.append((a, b))
+            a = b
+    if a < n:
+        bounds.append((a, n))
+    log(
+        f"Candidates: {n:,} pairs, {len(starts):,} S1 -> {len(bounds)} parts ({time.time() - t0:.1f}s)"
+    )
+
+    t0 = time.time()
+    s1_tab = pq.read_table(work / "checkpoints" / "test_s1_wide.parquet").combine_chunks()
+    tgt_tab = pq.read_table(work / "checkpoints" / "test_target_wide.parquet").combine_chunks()
+    for prefix, tab in (("s1", s1_tab), ("tgt", tgt_tab)):
+        keys = _fixed_bytes_ids(tab["entity_id"])
+        order = np.argsort(keys, kind="stable")
+        _LEAN[f"{prefix}_keys"] = keys[order]
+        _LEAN[f"{prefix}_order"] = order
+        _LEAN[f"{prefix}_tab"] = tab
+        del keys
+    _LEAN["cands"] = cands
+    _LEAN["bounds"] = bounds
+    _LEAN["out_dir"] = str(out_dir)
+    gc.collect()
+    log(f"Loaded Arrow tables in {time.time() - t0:.1f}s {rss_gb()}")
+
+    done = [0]
+    todo = [i for i in range(len(bounds)) if not (out_dir / f"part_{i:05d}.parquet").is_file()]
+    log(
+        f"{len(bounds) - len(todo)} parts already done; {len(todo)} to go with {args.n_jobs} workers"
+    )
+    t0 = time.time()
+
+    def _tick(_i: int, _r: int) -> None:
+        done[0] += 1
+        if done[0] % 10 == 0 or done[0] == len(todo):
+            el = time.time() - t0
+            eta = el / done[0] * (len(todo) - done[0])
+            log(
+                f"features {done[0]}/{len(todo)} parts, {el:.0f}s elapsed, ETA {eta:.0f}s {rss_gb()}"
+            )
+
+    run_pool(
+        _lean_feature_task,
+        todo,
+        max_workers=args.n_jobs,
+        label="lean-features",
+        max_retries=6,
+        on_result=_tick,
+    )
+    missing = [i for i in range(len(bounds)) if not (out_dir / f"part_{i:05d}.parquet").is_file()]
+    if missing:
+        raise RuntimeError(f"{len(missing)} feature parts missing")
+    (work / "feat_parts.done").write_text(str(len(bounds)))
+    log(f"All {len(bounds)} feature parts written in {time.time() - t0:.1f}s")
+
+
 # --------------------------------------------------------------------------- train
 def _matcher(cfg: str, cols: list[str], seed: int, threads: int) -> LightGBMMatcher:
     lr, leaves, depth, trees = CONFIGS[cfg]
@@ -235,30 +383,35 @@ def stage_score(args: argparse.Namespace) -> None:
     meta = json.loads((work / "model_meta.json").read_text())
     tau = float(args.tau if args.tau is not None else meta["tau"])
     cfg = meta["config"]
-
-    t0 = time.time()
-    feats = pd.read_parquet(work / "test_features.parquet")
-    feats["s1_id"] = feats["s1_id"].astype("category")
-    log(f"Loaded {len(feats):,} test pairs in {time.time() - t0:.1f}s")
+    feat_dir = Path(args.features_dir) if args.features_dir else work / "feat_parts"
 
     scored_path = work / "test_scored_pairs.parquet"
     if scored_path.is_file():
         scored = pd.read_parquet(scored_path)
         log("Loaded cached scored pairs")
     else:
-        t0 = time.time()
         p1 = _matcher(cfg, list(FEATURE_COLUMNS), 42, args.threads)
         p1.load_model(work / "model_pass1.txt")
-        feats["prob"] = _predict_chunked(p1, feats)
-        compute_entity_meta_features(feats, prob_col="prob")
         p2 = _matcher(cfg, list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS), 1042, args.threads)
         p2.load_model(work / "model_pass2.txt")
-        feats["prob"] = _predict_chunked(p2, feats)
-        scored = feats[["s1_id", "cand_id", "prob"]].copy()
-        scored["s1_id"] = scored["s1_id"].astype(str)
+        parts = sorted(feat_dir.glob("part_*.parquet"))
+        if not parts:
+            raise FileNotFoundError(f"No feature parts in {feat_dir}")
+        t0 = time.time()
+        outs: list[pd.DataFrame] = []
+        for k, part in enumerate(parts):
+            df = pd.read_parquet(part)
+            df["prob"] = p1.predict_proba(df)
+            compute_entity_meta_features(df, prob_col="prob")
+            df["prob"] = p2.predict_proba(df)
+            outs.append(df[["s1_id", "cand_id", "prob"]].copy())
+            del df
+            if (k + 1) % 20 == 0 or k + 1 == len(parts):
+                log(f"scored {k + 1}/{len(parts)} parts in {time.time() - t0:.0f}s")
+        scored = pd.concat(outs, ignore_index=True)
+        del outs
         scored.to_parquet(scored_path, index=False)
-        log(f"Scored in {time.time() - t0:.1f}s")
-    del feats
+        log(f"Scored {len(scored):,} pairs in {time.time() - t0:.1f}s")
     gc.collect()
 
     probs = scored["prob"].to_numpy()
@@ -296,6 +449,11 @@ def main() -> None:
     a.add_argument("--max-candidates", type=int, default=35)
     a.add_argument("--block-batch", type=int, default=500)
 
+    f = sub.add_parser("features")
+    f.add_argument("--work-dir", default="submission_work")
+    f.add_argument("--n-jobs", type=int, default=24)
+    f.add_argument("--part-pairs", type=int, default=250_000)
+
     b = sub.add_parser("train")
     b.add_argument("--train-features", required=True)
     b.add_argument("--work-dir", default="submission_work")
@@ -310,9 +468,15 @@ def main() -> None:
     c.add_argument("--threads", type=int, default=32)
     c.add_argument("--no-exclusive", action="store_true")
     c.add_argument("--output", default=None)
+    c.add_argument("--features-dir", default=None)
 
     args = ap.parse_args()
-    {"prepare": stage_prepare, "train": stage_train, "score": stage_score}[args.stage](args)
+    {
+        "prepare": stage_prepare,
+        "features": stage_features,
+        "train": stage_train,
+        "score": stage_score,
+    }[args.stage](args)
 
 
 if __name__ == "__main__":
