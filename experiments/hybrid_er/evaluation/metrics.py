@@ -57,10 +57,26 @@ def evaluate_matcher_predictions(gt: Dict[str, Set[str]], preds_dict: Dict[str, 
     Delegates to the trusted Parallax evaluator to calculate TP, FP, CFN, BFN, and Macro F0.5.
     Ensures that empty predictions for zero-match S1s are properly represented.
     """
-    # Ensure every S1 in eval_s1_ids has an entry, even if empty
+    from experiments.hybrid_er.core.validation import validate_prediction_population
+    
+    # 1. Construct evaluation-scoped GT (P0-A)
+    gt_eval = {}
+    for s1 in eval_s1_ids:
+        s1_str = str(s1)
+        if s1_str not in gt:
+            raise ValueError(f"Evaluation S1 ID {s1_str} missing from ground truth.")
+        gt_eval[s1_str] = set(str(x) for x in gt[s1_str])
+        
+    if set(gt_eval.keys()) != set([str(x) for x in eval_s1_ids]):
+        raise ValueError("gt_eval keys do not exactly match eval_s1_ids.")
+
+    # 2. Ensure every S1 in eval_s1_ids has an entry, even if empty
     safe_preds = {str(s1): set() for s1 in eval_s1_ids}
     for k, v in preds_dict.items():
-        if str(k) in safe_preds:
-            safe_preds[str(k)] = set([str(x) for x in v])
+        if str(k) not in safe_preds:
+            raise ValueError(f"Prediction contains extra S1 ID {k} not in evaluation population.")
+        safe_preds[str(k)] = set(str(x) for x in v)
+        
+    validate_prediction_population(safe_preds, eval_s1_ids)
             
-    return evaluate_resolution_predictions(gt, safe_preds)
+    return evaluate_resolution_predictions(gt_eval, safe_preds)

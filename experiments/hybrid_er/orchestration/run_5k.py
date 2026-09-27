@@ -1,9 +1,12 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import sys
 import time
 import argparse
 import pandas as pd
 import numpy as np
+import torch
 from pathlib import Path
 
 # Add project root to sys path
@@ -14,7 +17,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 from parallax.data.contracts import load_ground_truth_dict
 
 # Internal imports
-from experiments.hybrid_er.core.validation import validate_candidate_schema, validate_source_contract, validate_evaluation_population
+from experiments.hybrid_er.core.validation import validate_candidate_schema, validate_source_contract, validate_evaluation_population, validate_gt_contract
 from experiments.hybrid_er.evaluation.metrics import evaluate_candidate_recall, evaluate_matcher_predictions
 from experiments.hybrid_er.core.serialization import serialize_full, serialize_name_only, serialize_address_only
 from experiments.hybrid_er.retrieval.neural_bge import DenseRetriever, FaissIndexManager
@@ -85,9 +88,11 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     device = select_best_gpu(gpu)
     s1_df, s2_df, s3_df, e0_cands, gt, eval_s1_ids = load_data()
     
-    validate_evaluation_population(s1_df, eval_s1_ids)
     s2_ids = set(s2_df['entity_id'].astype(str))
     s3_ids = set(s3_df['entity_id'].astype(str))
+    
+    validate_evaluation_population(s1_df, eval_s1_ids)
+    validate_gt_contract(gt, eval_s1_ids, s2_ids, s3_ids)
     
     print("1. Running Structural Retrieval (Channel F)...")
     structural_cands = run_structural_retrieval(s1_df, s2_df, s3_df)
