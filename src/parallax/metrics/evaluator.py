@@ -116,6 +116,48 @@ def evaluate_resolution_predictions(
     )
 
 
+def macro_f05_threshold_scan(
+    s1_ids: Sequence[str] | np.ndarray,
+    is_true_pair: np.ndarray,
+    probs: np.ndarray,
+    ground_truth: Mapping[str, set[str]],
+    thresholds: Sequence[float],
+) -> list[float]:
+    """
+    Vectorized exact Macro F0.5 for many thresholds at once.
+    Equivalent to evaluate_resolution_predictions(ground_truth, {pairs with prob >= tau})
+    for each tau, but O(pairs) numpy work per threshold instead of Python set building.
+    Pairs whose s1_id is not in ground_truth are ignored; entities with no pairs count as
+    empty predictions.
+    """
+    gt_ids = list(ground_truth.keys())
+    n_ent = len(gt_ids)
+    if n_ent == 0:
+        return [0.0 for _ in thresholds]
+    code_of = {k: i for i, k in enumerate(gt_ids)}
+    codes = np.fromiter((code_of.get(str(s), -1) for s in s1_ids), dtype=np.int64, count=len(probs))
+    keep = codes >= 0
+    codes = codes[keep]
+    truth = np.asarray(is_true_pair, dtype=bool)[keep]
+    p = np.asarray(probs, dtype=np.float64)[keep]
+    true_counts = np.fromiter((len(ground_truth[k]) for k in gt_ids), dtype=np.float64, count=n_ent)
+    singleton = true_counts == 0
+
+    scores: list[float] = []
+    for tau in thresholds:
+        pred = p >= tau
+        npred = np.bincount(codes, weights=pred.astype(np.float64), minlength=n_ent)
+        tp = np.bincount(codes, weights=(pred & truth).astype(np.float64), minlength=n_ent)
+        f = np.zeros(n_ent, dtype=np.float64)
+        f[singleton & (npred == 0)] = 1.0
+        ok = (~singleton) & (npred > 0) & (tp > 0)
+        prec = tp[ok] / npred[ok]
+        rec = tp[ok] / true_counts[ok]
+        f[ok] = (1.25 * prec * rec) / (0.25 * prec + rec)
+        scores.append(float(np.mean(f)))
+    return scores
+
+
 def evaluate_blocking_candidates(
     ground_truth: Mapping[str, set[str]],
     candidates: Mapping[str, Collection[str]],

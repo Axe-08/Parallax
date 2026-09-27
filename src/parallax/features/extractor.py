@@ -9,10 +9,8 @@ and entity-level context.
 
 from __future__ import annotations
 
-import multiprocessing
 import os
 from collections.abc import Collection, Mapping
-from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 
 import jellyfish
@@ -173,25 +171,35 @@ FEATURE_COLUMNS = [
 ]
 
 _CURRENT_EXTRACTOR: PairwiseFeatureExtractor | None = None
-_CURRENT_S1_DICT: Mapping[str, Any] | None = None
-_CURRENT_TARGET_DICT: Mapping[str, Any] | None = None
+_CURRENT_S1_DF: pd.DataFrame | None = None
+_CURRENT_TARGET_DF: pd.DataFrame | None = None
+_CURRENT_TARGET_LOOKUP: Mapping[str, Any] | None = None
+_CURRENT_CAND_ITEMS: list[tuple[str, Any]] | None = None
 _CURRENT_GT: Mapping[str, set[str]] | None = None
 
 
-def _worker_extract_features(
-    chunk_cand_dict: dict[str, Any],
-) -> pd.DataFrame:
-    global _CURRENT_EXTRACTOR, _CURRENT_S1_DICT, _CURRENT_TARGET_DICT, _CURRENT_GT
-    if (
-        _CURRENT_EXTRACTOR is None
-        or _CURRENT_S1_DICT is None
-        or _CURRENT_TARGET_DICT is None
-    ):
+def _worker_extract_slice(bounds: tuple[int, int]) -> pd.DataFrame:
+    """
+    Extract features for one contiguous slice of S1 queries.
+    Each worker builds record lookups only for the S1/target ids its slice needs,
+    reading the fork-shared widened DataFrames (no giant parent-side dict, no pickling).
+    """
+    if _CURRENT_EXTRACTOR is None or _CURRENT_CAND_ITEMS is None or _CURRENT_S1_DF is None:
         raise RuntimeError("Worker process lost extractor context.")
+    start, end = bounds
+    chunk = dict(_CURRENT_CAND_ITEMS[start:end])
+    s1_dict = _CURRENT_EXTRACTOR.build_record_lookup(_CURRENT_S1_DF, needed_ids=set(chunk))
+    if _CURRENT_TARGET_LOOKUP is not None:
+        target_dict: Mapping[str, Any] = _CURRENT_TARGET_LOOKUP
+    else:
+        if _CURRENT_TARGET_DF is None:
+            raise RuntimeError("Worker process lost target context.")
+        needed = {c for cands in chunk.values() for c in cands}
+        target_dict = _CURRENT_EXTRACTOR.build_record_lookup(_CURRENT_TARGET_DF, needed_ids=needed)
     return _CURRENT_EXTRACTOR._extract_features_serial(
-        chunk_cand_dict,
-        s1_dict=_CURRENT_S1_DICT,
-        target_dict=_CURRENT_TARGET_DICT,
+        chunk,
+        s1_dict=s1_dict,
+        target_dict=target_dict,
         ground_truth=_CURRENT_GT,
         show_progress=False,
     )
@@ -357,17 +365,7 @@ class PairwiseFeatureExtractor:
         Accepts either target_df or precomputed target_lookup to maximize throughput.
         When n_jobs > 1, chunks candidate pairs across worker processes.
         """
-        needed_s1 = set(candidate_pairs.keys())
-        s1_dict = self.build_record_lookup(s1_df, needed_ids=needed_s1)
-        if target_lookup is not None:
-            target_dict = target_lookup
-        else:
-            if target_df is None:
-                raise ValueError(
-                    "Either target_df or target_lookup must be provided to extract_features_df."
-                )
-            needed_target = {cand for cands in candidate_pairs.values() for cand in cands}
-            target_dict = self.build_record_lookup(target_df, needed_ids=needed_target)
+        from parallax.utils.parallel import chunk_bounds, fork_available, run_pool
 
         total_pairs = sum(len(cands) for cands in candidate_pairs.values())
         if total_pairs == 0:
@@ -375,12 +373,19 @@ class PairwiseFeatureExtractor:
             if ground_truth is not None:
                 cols.append("target")
             return pd.DataFrame(columns=cols)
+        if target_lookup is None and target_df is None:
+            raise ValueError(
+                "Either target_df or target_lookup must be provided to extract_features_df."
+            )
 
-        if (
-            n_jobs <= 1
-            or len(candidate_pairs) < 1000
-            or "fork" not in multiprocessing.get_all_start_methods()
-        ):
+        if n_jobs <= 1 or len(candidate_pairs) < 1000 or not fork_available():
+            s1_dict = self.build_record_lookup(s1_df, needed_ids=set(candidate_pairs.keys()))
+            if target_lookup is not None:
+                target_dict = target_lookup
+            else:
+                assert target_df is not None
+                needed_target = {cand for cands in candidate_pairs.values() for cand in cands}
+                target_dict = self.build_record_lookup(target_df, needed_ids=needed_target)
             return self._extract_features_serial(
                 candidate_pairs,
                 s1_dict=s1_dict,
@@ -389,37 +394,38 @@ class PairwiseFeatureExtractor:
                 show_progress=show_progress,
             )
 
-        # Multi-process parallelization with copy-on-write shared lookups
-        s1_keys = list(candidate_pairs.keys())
-        chunks = np.array_split(s1_keys, n_jobs)
-        chunk_cand_dicts = [
-            {k: candidate_pairs[k] for k in chunk if k in candidate_pairs}
-            for chunk in chunks
-        ]
-        valid_chunks = [cd for cd in chunk_cand_dicts if len(cd) > 0]
-        if len(valid_chunks) <= 1:
-            return self._extract_features_serial(
-                candidate_pairs,
-                s1_dict=s1_dict,
-                target_dict=target_dict,
-                ground_truth=ground_truth,
-                show_progress=show_progress,
-            )
-
-        global _CURRENT_EXTRACTOR, _CURRENT_S1_DICT, _CURRENT_TARGET_DICT, _CURRENT_GT
+        global _CURRENT_EXTRACTOR, _CURRENT_S1_DF, _CURRENT_TARGET_DF
+        global _CURRENT_TARGET_LOOKUP, _CURRENT_CAND_ITEMS, _CURRENT_GT
         _CURRENT_EXTRACTOR = self
-        _CURRENT_S1_DICT = s1_dict
-        _CURRENT_TARGET_DICT = target_dict
+        _CURRENT_S1_DF = s1_df
+        _CURRENT_TARGET_DF = target_df
+        _CURRENT_TARGET_LOOKUP = target_lookup
+        _CURRENT_CAND_ITEMS = list(candidate_pairs.items())
         _CURRENT_GT = ground_truth
-
-        ctx = multiprocessing.get_context("fork")
+        # 2x over-partitioning: balances stragglers while limiting duplicate lookup builds.
+        tasks = chunk_bounds(len(_CURRENT_CAND_ITEMS), n_jobs * 2)
+        pbar = tqdm(
+            total=len(tasks),
+            desc="  ⚡ Feature slices",
+            unit="slice",
+            leave=False,
+            disable=not show_progress,
+        )
         try:
-            with ProcessPoolExecutor(max_workers=len(valid_chunks), mp_context=ctx) as executor:
-                chunk_dfs = list(executor.map(_worker_extract_features, valid_chunks))
+            chunk_dfs = run_pool(
+                _worker_extract_slice,
+                tasks,
+                max_workers=n_jobs,
+                label="features",
+                on_result=lambda _i, _r: pbar.update(1),
+            )
         finally:
+            pbar.close()
             _CURRENT_EXTRACTOR = None
-            _CURRENT_S1_DICT = None
-            _CURRENT_TARGET_DICT = None
+            _CURRENT_S1_DF = None
+            _CURRENT_TARGET_DF = None
+            _CURRENT_TARGET_LOOKUP = None
+            _CURRENT_CAND_ITEMS = None
             _CURRENT_GT = None
 
         return pd.concat(chunk_dfs, ignore_index=True)

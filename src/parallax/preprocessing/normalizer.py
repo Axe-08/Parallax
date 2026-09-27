@@ -10,12 +10,9 @@ Non-destructive data widening and multilingual text canonicalization:
 
 from __future__ import annotations
 
-import multiprocessing
 import re
 import unicodedata
-from concurrent.futures import ProcessPoolExecutor
 
-import numpy as np
 import pandas as pd
 
 from parallax.preprocessing.transliteration import transliterate_brahmic_to_latin
@@ -318,30 +315,49 @@ def widen_records_df(df: pd.DataFrame, n_jobs: int = 1) -> pd.DataFrame:
     without modifying the original raw columns.
     When n_jobs > 1 and len(df) >= 2000, distributes chunks across worker processes.
     """
-    if len(df) == 0:
-        return df.copy()
+    return widen_many_records_dfs([df], n_jobs=n_jobs)[0]
 
-    if n_jobs <= 1 or len(df) < 2000:
-        return _widen_records_chunk(df)
 
-    chunk_size = int(np.ceil(len(df) / n_jobs))
-    valid_chunks = [
-        df.iloc[i : i + chunk_size].copy()
-        for i in range(0, len(df), chunk_size)
-    ]
-    if len(valid_chunks) <= 1:
-        return _widen_records_chunk(df)
+_WIDEN_SOURCES: list[pd.DataFrame] = []
 
-    ctx = (
-        multiprocessing.get_context("fork")
-        if "fork" in multiprocessing.get_all_start_methods()
-        else None
-    )
-    with ProcessPoolExecutor(
-        max_workers=min(n_jobs, len(valid_chunks)),
-        mp_context=ctx,
-    ) as executor:
-        results = list(executor.map(_widen_records_chunk, valid_chunks))
 
-    return pd.concat(results, ignore_index=True)
+def _widen_task(task: tuple[int, int, int]) -> pd.DataFrame:
+    src_idx, start, end = task
+    return _widen_records_chunk(_WIDEN_SOURCES[src_idx].iloc[start:end])
 
+
+def widen_many_records_dfs(dfs: list[pd.DataFrame], n_jobs: int = 1) -> list[pd.DataFrame]:
+    """
+    Widen several record tables in a single shared worker pool.
+    Source frames are shared with forked workers via copy-on-write (no pickling of inputs);
+    chunks are over-partitioned (4x workers) for load balancing on contended machines.
+    """
+    from parallax.utils.parallel import chunk_bounds, run_pool
+
+    global _WIDEN_SOURCES
+    total = sum(len(d) for d in dfs)
+    if n_jobs <= 1 or total < 2000:
+        return [_widen_records_chunk(d) if len(d) else d.copy() for d in dfs]
+
+    n_chunks_total = max(1, n_jobs * 4)
+    tasks: list[tuple[int, int, int]] = []
+    for i, d in enumerate(dfs):
+        share = max(1, round(n_chunks_total * len(d) / max(total, 1)))
+        tasks.extend((i, a, b) for a, b in chunk_bounds(len(d), share))
+
+    _WIDEN_SOURCES = list(dfs)
+    try:
+        parts = run_pool(_widen_task, tasks, max_workers=n_jobs, label="widen")
+    finally:
+        _WIDEN_SOURCES = []
+
+    out: list[pd.DataFrame] = []
+    for i, d in enumerate(dfs):
+        mine = [p for t, p in zip(tasks, parts, strict=True) if t[0] == i]
+        if not mine:
+            out.append(d.copy())
+            continue
+        res = pd.concat(mine, ignore_index=False)
+        res.index = d.index
+        out.append(res.reset_index(drop=True) if d.index.equals(pd.RangeIndex(len(d))) else res)
+    return out

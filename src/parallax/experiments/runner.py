@@ -47,8 +47,65 @@ from parallax.metrics.evaluator import (
 )
 from parallax.models.matcher import LightGBMMatcher
 from parallax.postprocessing.singleton_gate import SingletonGatedPredictor
-from parallax.preprocessing.normalizer import widen_records_df
+from parallax.preprocessing.normalizer import widen_many_records_dfs
 from parallax.utils.checkpoint_manager import CheckpointManager
+from parallax.utils.parallel import resolve_workers, run_pool, total_threads
+
+# Bump when a code change alters stage outputs, to invalidate all config-keyed caches.
+PIPELINE_CACHE_VERSION = "v4"
+
+
+def fingerprint(*parts: object) -> str:
+    """Short stable hash of stage inputs, used to key every Parquet/JSON cache."""
+    import hashlib
+
+    h = hashlib.sha1(PIPELINE_CACHE_VERSION.encode())
+    for p in parts:
+        h.update(b"\x1f")
+        h.update(repr(p).encode())
+    return h.hexdigest()[:10]
+
+
+def data_fingerprint(data_path: Path, sample_s1: int | None) -> str:
+    """Fingerprint input files by name, size and mtime (cheap; no content hashing)."""
+    stats = []
+    for f in sorted(data_path.glob("*")):
+        if f.is_file():
+            st = f.stat()
+            stats.append((f.name, st.st_size, int(st.st_mtime)))
+    return fingerprint("data", str(data_path.resolve()), stats, sample_s1)
+
+
+def subsample_sweep_pairs(
+    features_df: pd.DataFrame,
+    cv_folds_df: pd.DataFrame,
+    gt_dict: Mapping[str, set[str]],
+    sweep_sample_s1: int | None,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, set[str]]]:
+    """
+    Build the Fold-0 sweep holdout, optionally subsampled by S1 entity:
+    up to sweep_sample_s1 training entities (folds != 0) and a quarter as many
+    validation entities (fold 0), preserving the 4:1 train/val ratio.
+    """
+    fold_ids = cv_folds_df["entity_id"].astype(str)
+    val_ids = fold_ids[cv_folds_df["fold"].to_numpy() == 0].to_numpy()
+    train_ids = fold_ids[cv_folds_df["fold"].to_numpy() != 0].to_numpy()
+    if sweep_sample_s1 and sweep_sample_s1 < len(train_ids):
+        rng = np.random.default_rng(seed)
+        train_ids = rng.choice(train_ids, size=sweep_sample_s1, replace=False)
+        n_val = min(len(val_ids), max(1, sweep_sample_s1 // 4))
+        val_ids = rng.choice(val_ids, size=n_val, replace=False)
+        print(
+            f"  ⚡ Sweep subsample: {len(train_ids):,} train S1 / {len(val_ids):,} val S1 "
+            f"(of {len(fold_ids):,})"
+        )
+    s1_col = features_df["s1_id"].astype(str)
+    val_set = set(val_ids.tolist())
+    val_pairs = features_df[s1_col.isin(val_set)].copy()
+    train_pairs = features_df[s1_col.isin(set(train_ids.tolist()))].copy()
+    val_gt = {k: v for k, v in gt_dict.items() if k in val_set}
+    return train_pairs, val_pairs, val_gt
 
 
 @dataclass
@@ -116,6 +173,7 @@ def generate_or_load_candidates(
     max_candidates_per_query: int = 35,
     checkpoint_mgr: CheckpointManager | None = None,
     n_jobs: int = 1,
+    ckpt_tag: str | None = None,
 ) -> dict[str, dict[str, float]]:
     """Generate or retrieve candidate pairs mapping s1_id -> candidate dict with sim scores."""
     if cache_path.is_file():
@@ -153,7 +211,7 @@ def generate_or_load_candidates(
         n_jobs=n_jobs,
     )
     candidates = blocker.generate_candidates(
-        s1_wide, target_wide, checkpoint_mgr=checkpoint_mgr, n_jobs=n_jobs
+        s1_wide, target_wide, checkpoint_mgr=checkpoint_mgr, n_jobs=n_jobs, ckpt_tag=ckpt_tag
     )
 
     elapsed = time.time() - t0
@@ -229,19 +287,112 @@ def extract_or_load_features(
     return features_df
 
 
+_SWEEP_STATE: dict[str, object] = {}
+_CV_STATE: dict[str, object] = {}
+
+
+def _sweep_config_task(task: tuple[HyperparamConfig, int]) -> SweepScore:
+    """Two-pass train + tau search for one config on the fork-shared Fold 0 holdout."""
+    cfg, threads = task
+    train_pairs = _SWEEP_STATE["train"]
+    val_pairs = _SWEEP_STATE["val"]
+    val_gt = _SWEEP_STATE["val_gt"]
+    assert isinstance(train_pairs, pd.DataFrame) and isinstance(val_pairs, pd.DataFrame)
+    assert isinstance(val_gt, dict)
+    predictor = SingletonGatedPredictor()
+    all_features = list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS)
+
+    matcher_p1 = LightGBMMatcher(
+        learning_rate=cfg.learning_rate,
+        num_leaves=cfg.num_leaves,
+        max_depth=cfg.max_depth,
+        n_estimators=cfg.n_estimators,
+        feature_columns=FEATURE_COLUMNS,
+        seed=42,
+        num_threads=threads,
+    )
+    matcher_p1.train(train_pairs, val_pairs)
+
+    train_copy = train_pairs.copy()
+    val_copy = val_pairs.copy()
+    train_copy["prob"] = matcher_p1.predict_proba(train_copy)
+    val_copy["prob"] = matcher_p1.predict_proba(val_copy)
+    compute_entity_meta_features(train_copy, prob_col="prob")
+    compute_entity_meta_features(val_copy, prob_col="prob")
+
+    matcher_p2 = LightGBMMatcher(
+        learning_rate=cfg.learning_rate,
+        num_leaves=cfg.num_leaves,
+        max_depth=cfg.max_depth,
+        n_estimators=cfg.n_estimators,
+        feature_columns=all_features,
+        seed=1042,
+        num_threads=threads,
+    )
+    matcher_p2.train(train_copy, val_copy)
+    search_range = [0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90]
+    best_tau, _ = matcher_p2.optimize_threshold(val_copy, val_gt, search_range=search_range)
+    val_copy["prob"] = matcher_p2.predict_proba(val_copy)
+    preds = predictor.filter_predictions(val_copy, list(val_gt.keys()), threshold=best_tau)
+    report = evaluate_resolution_predictions(val_gt, preds)
+    return SweepScore(
+        config=cfg,
+        optimal_tau=best_tau,
+        macro_f05=report.macro_f05,
+        singleton_acc=report.singleton_score,
+        non_singleton_f05=report.non_singleton_f05,
+    )
+
+
+def _cv_fold_task(
+    task: tuple[int, HyperparamConfig, float, int],
+) -> tuple[FoldMetric, dict[str, set[str]], pd.DataFrame]:
+    """Evaluate one CV fold reading the feature matrix from fork-shared state."""
+    k, best_cfg, base_tau, threads = task
+    features_df = _CV_STATE["features_df"]
+    s1_fold_arr = _CV_STATE["s1_fold_arr"]
+    cv_folds_df = _CV_STATE["cv_folds_df"]
+    gt_dict = _CV_STATE["gt_dict"]
+    assert isinstance(features_df, pd.DataFrame) and isinstance(cv_folds_df, pd.DataFrame)
+    assert isinstance(s1_fold_arr, np.ndarray) and isinstance(gt_dict, dict)
+    ckpt = _CV_STATE.get("checkpoint_mgr")
+    sample = _CV_STATE.get("sample_s1")
+    tag = _CV_STATE.get("ckpt_tag")
+    return evaluate_single_fold(
+        k,
+        features_df,
+        s1_fold_arr,
+        cv_folds_df,
+        gt_dict,
+        best_cfg,
+        base_tau,
+        checkpoint_mgr=ckpt if isinstance(ckpt, CheckpointManager) else None,
+        sample_s1=sample if isinstance(sample, int) else None,
+        threads_per_worker=threads,
+        record_manifest=False,
+        ckpt_tag=tag if isinstance(tag, str) else None,
+    )
+
+
 def run_sweep(
     train_pairs: pd.DataFrame,
     val_pairs: pd.DataFrame,
     val_gt: Mapping[str, set[str]],
     checkpoint_mgr: CheckpointManager | None = None,
     sample_s1: int | None = None,
+    n_jobs: int = 1,
+    sweep_worker_gb: float = 7.0,
+    ckpt_tag: str | None = None,
 ) -> tuple[HyperparamConfig, float]:
     """Execute hyperparameter sweep on validation holdout to find peak Macro F0.5."""
     print("================================================================================")
     print("🔬 STAGE 4: HYPERPARAMETER GRID SWEEP (VAL HOLDOUT)")
     print("================================================================================")
 
-    sw_key = f"sweep_results_sample_{sample_s1}" if sample_s1 else "sweep_results"
+    if ckpt_tag:
+        sw_key = f"sweep_{ckpt_tag}"
+    else:
+        sw_key = f"sweep_results_sample_{sample_s1}" if sample_s1 else "sweep_results"
     if checkpoint_mgr is not None and checkpoint_mgr.has_checkpoint(sw_key, ext="json"):
         data = checkpoint_mgr.load_json(sw_key)
         if data and "config" in data and "optimal_tau" in data:
@@ -298,7 +449,6 @@ def run_sweep(
         ),
     ]
 
-    predictor = SingletonGatedPredictor()
     val_s1_ids = list(val_gt.keys())
     scores: list[SweepScore] = []
 
@@ -307,69 +457,81 @@ def run_sweep(
         f"{'Config':<18} | {'LR':<5} | {'Leaves':<6} | {'Trees':<5} | "
         f"{'tau':<6} | {'Macro F0.5':<10} | {'Sing. Acc':<10} | {'Non-Sing F0.5':<12}"
     )
+
+    def _cfg_key(cfg: HyperparamConfig) -> str:
+        return f"{sw_key}_cfg_{cfg.name}"
+
+    todo: list[HyperparamConfig] = []
+    for cfg in configs:
+        cached = (
+            checkpoint_mgr.load_json(_cfg_key(cfg))
+            if checkpoint_mgr is not None and checkpoint_mgr.has_checkpoint(_cfg_key(cfg), "json")
+            else None
+        )
+        if cached is not None:
+            scores.append(
+                SweepScore(
+                    config=cfg,
+                    optimal_tau=float(cached["optimal_tau"]),
+                    macro_f05=float(cached["macro_f05"]),
+                    singleton_acc=float(cached["singleton_acc"]),
+                    non_singleton_f05=float(cached["non_singleton_f05"]),
+                )
+            )
+        else:
+            todo.append(cfg)
+
+    if todo:
+        workers = resolve_workers(n_jobs, per_worker_gb=sweep_worker_gb, n_tasks=len(todo))
+        threads = max(1, total_threads() // workers)
+        print(
+            f"  ⚡ Training {len(todo)} configs concurrently "
+            f"({workers} workers × {threads} LightGBM threads)..."
+        )
+        global _SWEEP_STATE
+        _SWEEP_STATE = {"train": train_pairs, "val": val_pairs, "val_gt": val_gt}
+
+        def _on_done(i: int, res: SweepScore) -> None:
+            print(
+                f"  ✓ [Sweep] {res.config.name}: Macro F0.5={res.macro_f05:.4f} "
+                f"tau={res.optimal_tau:.2f}",
+                flush=True,
+            )
+            if checkpoint_mgr is not None:
+                checkpoint_mgr.save_json(
+                    _cfg_key(res.config),
+                    {
+                        "optimal_tau": res.optimal_tau,
+                        "macro_f05": res.macro_f05,
+                        "singleton_acc": res.singleton_acc,
+                        "non_singleton_f05": res.non_singleton_f05,
+                    },
+                )
+
+        try:
+            new_scores = run_pool(
+                _sweep_config_task,
+                [(cfg, threads) for cfg in todo],
+                max_workers=workers,
+                threads_per_worker=threads,
+                label="sweep",
+                on_result=_on_done,
+            )
+        finally:
+            _SWEEP_STATE = {}
+        scores.extend(new_scores)
+
+    order = {c.name: i for i, c in enumerate(configs)}
+    scores.sort(key=lambda sc: order[sc.config.name])
     print(header)
     print("-" * len(header))
-
-    all_features = list(FEATURE_COLUMNS) + list(META_FEATURE_COLUMNS)
-
-    for cfg in tqdm(configs, desc="  ⚡ Tuning Fold 0", unit="config", leave=False):
-        # Pass 1: Raw 49 Features
-        matcher_p1 = LightGBMMatcher(
-            learning_rate=cfg.learning_rate,
-            num_leaves=cfg.num_leaves,
-            max_depth=cfg.max_depth,
-            n_estimators=cfg.n_estimators,
-            feature_columns=FEATURE_COLUMNS,
-            seed=42,
-            num_threads=8,
-        )
-        matcher_p1.train(train_pairs, val_pairs)
-
-        train_copy = train_pairs.copy()
-        val_copy = val_pairs.copy()
-        train_copy["prob"] = matcher_p1.predict_proba(train_copy)
-        val_copy["prob"] = matcher_p1.predict_proba(val_copy)
-
-        # Entity Meta-Features (Track A)
-        compute_entity_meta_features(train_copy, prob_col="prob")
-        compute_entity_meta_features(val_copy, prob_col="prob")
-
-        # Pass 2: Combined 54 Features
-        matcher_p2 = LightGBMMatcher(
-            learning_rate=cfg.learning_rate,
-            num_leaves=cfg.num_leaves,
-            max_depth=cfg.max_depth,
-            n_estimators=cfg.n_estimators,
-            feature_columns=all_features,
-            seed=1042,
-            num_threads=8,
-        )
-        matcher_p2.train(train_copy, val_copy)
-
-        search_range = [0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90]
-        best_tau, _ = matcher_p2.optimize_threshold(val_copy, val_gt, search_range=search_range)
-
-        # Evaluate complete metrics at best tau
-        val_copy["prob"] = matcher_p2.predict_proba(val_copy)
-        preds = predictor.filter_predictions(val_copy, val_s1_ids, threshold=best_tau)
-        report = evaluate_resolution_predictions(val_gt, preds)
-
-        scores.append(
-            SweepScore(
-                config=cfg,
-                optimal_tau=best_tau,
-                macro_f05=report.macro_f05,
-                singleton_acc=report.singleton_score,
-                non_singleton_f05=report.non_singleton_f05,
-            )
-        )
-
-        row_str = (
+    for sc in scores:
+        cfg = sc.config
+        print(
             f"{cfg.name:<18} | {cfg.learning_rate:<5.2f} | {cfg.num_leaves:<6} | "
-            f"{cfg.n_estimators:<5} | {best_tau:<6.2f} | {report.macro_f05:<10.4f} | "
-            f"{report.singleton_score * 100:<9.2f}% | {report.non_singleton_f05:<12.4f}"
+            f"{cfg.n_estimators:<5} | {sc.optimal_tau:<6.2f} | {sc.macro_f05:<10.4f} | "
+            f"{sc.singleton_acc * 100:<9.2f}% | {sc.non_singleton_f05:<12.4f}"
         )
-        print(row_str)
 
     best_sweep = max(scores, key=lambda s: s.macro_f05)
     print("-" * len(header))
@@ -401,6 +563,18 @@ def run_sweep(
     return best_sweep.config, best_sweep.optimal_tau
 
 
+def fold_checkpoint_keys(k: int, sample_s1: int | None, ckpt_tag: str | None) -> tuple[str, str]:
+    """(metrics_key, scored_pairs_key) for a fold; ckpt_tag keys them by full stage config."""
+    if ckpt_tag:
+        return f"fold_{k}_metrics_{ckpt_tag}", f"fold_{k}_scored_pairs_{ckpt_tag}"
+    if sample_s1:
+        return f"fold_{k}_metrics_sample_{sample_s1}", f"fold_{k}_scored_pairs_sample_{sample_s1}"
+    return f"fold_{k}_metrics", f"fold_{k}_scored_pairs"
+
+
+FOLD_TAU_OFFSETS = [round(-0.12 + 0.02 * i, 2) for i in range(13)]
+
+
 def evaluate_single_fold(
     k: int,
     features_df: pd.DataFrame,
@@ -412,15 +586,14 @@ def evaluate_single_fold(
     checkpoint_mgr: CheckpointManager | None = None,
     sample_s1: int | None = None,
     threads_per_worker: int | None = None,
+    record_manifest: bool = True,
+    ckpt_tag: str | None = None,
 ) -> tuple[FoldMetric, dict[str, set[str]], pd.DataFrame]:
     """Execute Two-Pass training, meta-feature engineering, and evaluation for a single fold."""
     val_s1_set = set(cv_folds_df[cv_folds_df["fold"] == k]["entity_id"].astype(str))
     val_gt = {k_id: v for k_id, v in gt_dict.items() if k_id in val_s1_set}
 
-    m_key = f"fold_{k}_metrics_sample_{sample_s1}" if sample_s1 else f"fold_{k}_metrics"
-    sp_key = (
-        f"fold_{k}_scored_pairs_sample_{sample_s1}" if sample_s1 else f"fold_{k}_scored_pairs"
-    )
+    m_key, sp_key = fold_checkpoint_keys(k, sample_s1, ckpt_tag)
 
     predictor = SingletonGatedPredictor()
 
@@ -478,14 +651,10 @@ def evaluate_single_fold(
     matcher_p2.train(train_pairs, val_df=val_pairs)
 
     # Optimize threshold tau on Pass 2 probabilities
-    search_range = [
-        base_tau - 0.08,
-        base_tau - 0.04,
-        base_tau,
-        base_tau + 0.04,
-        base_tau + 0.08,
-    ]
-    search_range = [t for t in search_range if 0.45 <= t <= 0.95]
+    # Fine grid around the sweep tau (cheap now that the scan is vectorized). The sweep may
+    # run on a subsample, so its tau is only a centre point for the full-data fold models.
+    search_range = [round(base_tau + d, 2) for d in FOLD_TAU_OFFSETS]
+    search_range = [t for t in search_range if 0.30 <= t <= 0.98] or [base_tau]
     best_tau_k, _ = matcher_p2.optimize_threshold(val_pairs, val_gt, search_range=search_range)
 
     # Out-of-fold inference with Pass 2 probabilities
@@ -499,9 +668,7 @@ def evaluate_single_fold(
         else 0.0
     )
     rec = (
-        report.total_correct_pairs / report.total_true_pairs
-        if report.total_true_pairs > 0
-        else 0.0
+        report.total_correct_pairs / report.total_true_pairs if report.total_true_pairs > 0 else 0.0
     )
     fold_metric = FoldMetric(
         fold=int(k),
@@ -520,10 +687,11 @@ def evaluate_single_fold(
     if checkpoint_mgr is not None:
         checkpoint_mgr.save_dataframe(sp_key, val_pairs[["s1_id", "cand_id", "prob"]])
         checkpoint_mgr.save_json(m_key, asdict(fold_metric))
-        checkpoint_mgr.record_stage_completed(
-            m_key,
-            {"optimal_tau": best_tau_k, "macro_f05": report.macro_f05},
-        )
+        if record_manifest:
+            checkpoint_mgr.record_stage_completed(
+                m_key,
+                {"optimal_tau": best_tau_k, "macro_f05": report.macro_f05},
+            )
 
     return fold_metric, fold_preds, val_pairs[["s1_id", "cand_id", "prob"]]
 
@@ -537,6 +705,8 @@ def run_cross_validation(
     checkpoint_mgr: CheckpointManager | None = None,
     sample_s1: int | None = None,
     n_jobs: int = 1,
+    cv_worker_gb: float = 8.0,
+    ckpt_tag: str | None = None,
 ) -> tuple[list[FoldMetric], dict[str, set[str]], pd.DataFrame]:
     """Execute Two-Pass 5-fold CV, return fold metrics and complete OOF predictions."""
     print("================================================================================")
@@ -565,45 +735,49 @@ def run_cross_validation(
     print("-" * len(header))
 
     if n_jobs > 1 and len(folds) > 1:
-        import concurrent.futures
-        import multiprocessing as mp
-
-        ctx = mp.get_context("fork")
-        workers = min(n_jobs, len(folds))
-        threads_per_worker = max(1, 40 // workers)
+        workers = resolve_workers(n_jobs, per_worker_gb=cv_worker_gb, n_tasks=len(folds))
+        threads_per_worker = max(1, total_threads() // workers)
         print(
             f"  ⚡ Launching {workers} concurrent fold worker processes "
-            f"(threads/worker={threads_per_worker})..."
+            f"(threads/worker={threads_per_worker}, shared-memory features)..."
         )
-        results_map: dict[int, tuple[FoldMetric, dict[str, set[str]], pd.DataFrame]] = {}
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=workers, mp_context=ctx
-        ) as executor:
-            futures = {
-                executor.submit(
-                    evaluate_single_fold,
-                    k,
-                    features_df,
-                    s1_fold_arr,
-                    cv_folds_df,
-                    gt_dict,
-                    best_cfg,
-                    base_tau,
-                    checkpoint_mgr,
-                    sample_s1,
-                    threads_per_worker,
-                ): k
-                for k in folds
-            }
-            for future in concurrent.futures.as_completed(futures):
-                k = futures[future]
-                res = future.result()
-                results_map[k] = res
-                f_m = res[0]
-                print(
-                    f"  ✓ [Parallel Worker] Fold {k} completed: "
-                    f"Macro F0.5={f_m.macro_f05:.4f}, tau={f_m.optimal_tau:.2f}, "
-                    f"Sing. Acc={f_m.singleton_acc*100:.2f}%"
+        global _CV_STATE
+        _CV_STATE = {
+            "features_df": features_df,
+            "s1_fold_arr": s1_fold_arr,
+            "cv_folds_df": cv_folds_df,
+            "gt_dict": dict(gt_dict),
+            "checkpoint_mgr": checkpoint_mgr,
+            "sample_s1": sample_s1,
+            "ckpt_tag": ckpt_tag,
+        }
+
+        def _on_fold(i: int, res: tuple[FoldMetric, dict[str, set[str]], pd.DataFrame]) -> None:
+            f_m = res[0]
+            print(
+                f"  ✓ [Parallel Worker] Fold {f_m.fold} completed: "
+                f"Macro F0.5={f_m.macro_f05:.4f}, tau={f_m.optimal_tau:.2f}, "
+                f"Sing. Acc={f_m.singleton_acc * 100:.2f}%",
+                flush=True,
+            )
+
+        try:
+            fold_outputs = run_pool(
+                _cv_fold_task,
+                [(int(k), best_cfg, base_tau, threads_per_worker) for k in folds],
+                max_workers=workers,
+                threads_per_worker=threads_per_worker,
+                label="cv",
+                on_result=_on_fold,
+            )
+        finally:
+            _CV_STATE = {}
+        results_map = {int(k): res for k, res in zip(folds, fold_outputs, strict=True)}
+        if checkpoint_mgr is not None:
+            for k, res in results_map.items():
+                m_key = fold_checkpoint_keys(k, sample_s1, ckpt_tag)[0]
+                checkpoint_mgr.record_stage_completed(
+                    m_key, {"optimal_tau": res[0].optimal_tau, "macro_f05": res[0].macro_f05}
                 )
 
         for k in folds:
@@ -630,6 +804,7 @@ def run_cross_validation(
                 base_tau=base_tau,
                 checkpoint_mgr=checkpoint_mgr,
                 sample_s1=sample_s1,
+                ckpt_tag=ckpt_tag,
             )
             fold_results.append(f_metric)
             oof_predictions.update(f_preds)
@@ -657,6 +832,53 @@ def run_cross_validation(
     return fold_results, oof_predictions, oof_scored_df
 
 
+def report_and_apply_target_exclusivity(
+    oof_scored_df: pd.DataFrame,
+    fold_results: list[FoldMetric],
+    cv_folds_df: pd.DataFrame,
+    gt_dict: Mapping[str, set[str]],
+    oof_predictions: dict[str, set[str]],
+    apply: bool = False,
+) -> dict[str, set[str]]:
+    """
+    Print OOF Macro F0.5 with and without the one-owner-per-target rule (keep a pair only if
+    its S1 has the highest probability for that target), using each fold's own tau.
+    Returns the exclusive predictions if apply=True, else the original predictions.
+    """
+    if oof_scored_df.empty:
+        return oof_predictions
+    tau_by_fold = {r.fold: r.optimal_tau for r in fold_results}
+    fold_map = dict(
+        zip(cv_folds_df["entity_id"].astype(str), cv_folds_df["fold"].astype(int), strict=False)
+    )
+    df = oof_scored_df[["s1_id", "cand_id", "prob"]].copy()
+    df["s1_id"] = df["s1_id"].astype(str)
+    df["cand_id"] = df["cand_id"].astype(str)
+    taus = df["s1_id"].map(fold_map).map(tau_by_fold).fillna(1.1).to_numpy()
+    base_mask = df["prob"].to_numpy() >= taus
+    cand_max = df.groupby("cand_id")["prob"].transform("max").to_numpy()
+    excl_mask = base_mask & (df["prob"].to_numpy() >= cand_max)
+
+    def _preds(mask: np.ndarray) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {s: set() for s in oof_predictions}
+        for s1, cand in zip(
+            df["s1_id"].to_numpy()[mask], df["cand_id"].to_numpy()[mask], strict=False
+        ):
+            if s1 in out:
+                out[s1].add(cand)
+        return out
+
+    excl_preds = _preds(excl_mask)
+    base_score = evaluate_resolution_predictions(gt_dict, oof_predictions).macro_f05
+    excl_score = evaluate_resolution_predictions(gt_dict, excl_preds).macro_f05
+    contested = int((base_mask & ~excl_mask).sum())
+    print(
+        f"📊 Target exclusivity what-if: OOF Macro F0.5 {base_score:.4f} -> {excl_score:.4f} "
+        f"({contested:,} contested pairs removed) [{'APPLIED' if apply else 'not applied'}]\n"
+    )
+    return excl_preds if apply else oof_predictions
+
+
 def run_benchmark(
     data_dir: Path | str = "data/medium_split_200k",
     output_dir: Path | str = "output",
@@ -667,6 +889,8 @@ def run_benchmark(
     sample_s1: int | None = None,
     n_jobs: int = 1,
     max_candidates: int = 35,
+    exclusive_targets: bool = False,
+    sweep_sample_s1: int | None = 50_000,
 ) -> None:
     """Execute complete benchmark workflow with two-pass meta-resolution."""
     data_path = Path(data_dir)
@@ -691,10 +915,19 @@ def run_benchmark(
     print("--- [Step 1: Loading Benchmark Split] ---")
     with pipeline_stage("Step 1: Loading Data", logger=exec_logger):
         t0 = time.time()
-        s1_df = load_business_records_df(data_path / "train_source1.tsv")
-        s2_df = load_business_records_df(data_path / "train_source2.tsv")
-        s3_df = load_business_records_df(data_path / "train_source3.tsv")
-        gt_dict = load_ground_truth_dict(data_path / "train_ground_truth.tsv")
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=4) as tpe:
+            f_s1 = tpe.submit(load_business_records_df, data_path / "train_source1.tsv")
+            f_s2 = tpe.submit(load_business_records_df, data_path / "train_source2.tsv")
+            f_s3 = tpe.submit(load_business_records_df, data_path / "train_source3.tsv")
+            f_gt = tpe.submit(load_ground_truth_dict, data_path / "train_ground_truth.tsv")
+            s1_df, s2_df, s3_df, gt_dict = (
+                f_s1.result(),
+                f_s2.result(),
+                f_s3.result(),
+                f_gt.result(),
+            )
         if (data_path / "cv_folds_source1.parquet").is_file():
             cv_folds_df = pd.read_parquet(data_path / "cv_folds_source1.parquet")
         else:
@@ -723,8 +956,9 @@ def run_benchmark(
     print("--- [Step 2: Preprocessing & Unicode / Entity Widening] ---")
     with pipeline_stage("Step 2: Preprocessing & Widening", logger=exec_logger):
         t0 = time.time()
-        s1_tag = f"s1_wide_{len(s1_df)}" if sample_s1 else "s1_wide"
-        target_tag = "target_wide"
+        data_fp = data_fingerprint(data_path, sample_s1)
+        s1_tag = f"s1_wide_{data_fp}"
+        target_tag = f"target_wide_{data_fp}"
         loaded_s1 = (
             checkpoint_mgr.load_dataframe(s1_tag)
             if not reset_checkpoints and checkpoint_mgr.has_checkpoint(s1_tag)
@@ -761,9 +995,7 @@ def run_benchmark(
                 f"target records in {time.time() - t0:.2f}s.\n"
             )
         else:
-            s1_wide = widen_records_df(s1_df, n_jobs=n_jobs)
-            s2_wide = widen_records_df(s2_df, n_jobs=n_jobs)
-            s3_wide = widen_records_df(s3_df, n_jobs=n_jobs)
+            s1_wide, s2_wide, s3_wide = widen_many_records_dfs([s1_df, s2_df, s3_df], n_jobs=n_jobs)
             target_wide = pd.concat([s2_wide, s3_wide], ignore_index=True)
             checkpoint_mgr.save_dataframe(s1_tag, s1_wide)
             checkpoint_mgr.save_dataframe(target_tag, target_wide)
@@ -777,11 +1009,11 @@ def run_benchmark(
     # Step 3: Candidate Generation (with Parquet caching)
     print("--- [Step 3: Multi-Channel Sparse & Phonetic Blocking] ---")
     with pipeline_stage("Step 3: Candidate Blocking", logger=exec_logger):
-        cand_cache = out_path / (
-            f"candidate_pairs_sample_{sample_s1}.parquet"
-            if sample_s1
-            else "candidate_pairs_medium_200k.parquet"
-        )
+        # Cache names are keyed by dataset, sample size and candidate cap so that changing
+        # the blocking configuration can never silently reuse stale candidates.
+        block_fp = fingerprint("blocking", data_fp, max_candidates, 35, 25, 0.15, 0.20, 2000)
+        run_tag = f"{data_path.name}_{block_fp}"
+        cand_cache = out_path / f"candidate_pairs_{run_tag}.parquet"
         candidates = generate_or_load_candidates(
             s1_wide,
             target_wide,
@@ -789,6 +1021,7 @@ def run_benchmark(
             max_candidates_per_query=max_candidates,
             checkpoint_mgr=checkpoint_mgr,
             n_jobs=n_jobs,
+            ckpt_tag=block_fp,
         )
 
         blocking_report = evaluate_blocking_candidates(gt_dict, candidates, len(target_wide))
@@ -804,9 +1037,8 @@ def run_benchmark(
     # Step 4: Feature Extraction (with Parquet caching)
     print("--- [Step 4: RapidFuzz Pairwise Feature Extraction (49 Features)] ---")
     with pipeline_stage("Step 4: Feature Extraction", logger=exec_logger):
-        feat_cache = out_path / (
-            f"features_sample_{sample_s1}.parquet" if sample_s1 else "features_medium_200k.parquet"
-        )
+        feat_fp = fingerprint("features", block_fp, list(FEATURE_COLUMNS))
+        feat_cache = out_path / f"features_{data_path.name}_{feat_fp}.parquet"
         features_df = extract_or_load_features(
             candidates, s1_wide, target_wide, gt_dict, feat_cache, n_jobs=n_jobs
         )
@@ -814,20 +1046,22 @@ def run_benchmark(
     exec_logger.check_memory_threshold()
 
     # Step 5: Hyperparameter Sweep (Fold 0 holdout)
-    fold_0_s1 = set(cv_folds_df[cv_folds_df["fold"] == 0]["entity_id"].astype(str))
-    val_pairs_0 = features_df[features_df["s1_id"].isin(fold_0_s1)].copy()
-    train_pairs_0 = features_df[~features_df["s1_id"].isin(fold_0_s1)].copy()
-    val_gt_0 = {k: v for k, v in gt_dict.items() if k in fold_0_s1}
-
+    sweep_fp = fingerprint("sweep", feat_fp, sweep_sample_s1)
     with pipeline_stage("Step 5: Hyperparameter Sweep", logger=exec_logger):
         if not skip_sweep:
+            train_pairs_0, val_pairs_0, val_gt_0 = subsample_sweep_pairs(
+                features_df, cv_folds_df, gt_dict, sweep_sample_s1
+            )
             best_cfg, base_tau = run_sweep(
                 train_pairs_0,
                 val_pairs_0,
                 val_gt_0,
                 checkpoint_mgr=checkpoint_mgr,
                 sample_s1=sample_s1,
+                n_jobs=n_jobs,
+                ckpt_tag=sweep_fp,
             )
+            del train_pairs_0, val_pairs_0
         else:
             best_cfg = HyperparamConfig(
                 name="Config-Deep",
@@ -851,6 +1085,19 @@ def run_benchmark(
             checkpoint_mgr=checkpoint_mgr,
             sample_s1=sample_s1,
             n_jobs=n_jobs,
+            ckpt_tag=fingerprint(
+                "cv", feat_fp, asdict(best_cfg), round(base_tau, 4), FOLD_TAU_OFFSETS
+            ),
+        )
+
+        # One-owner-per-target post-processing (each target matches at most one S1)
+        oof_predictions = report_and_apply_target_exclusivity(
+            oof_scored_df,
+            fold_results,
+            cv_folds_df,
+            gt_dict,
+            oof_predictions,
+            apply=exclusive_targets,
         )
 
         # Save final OOF matching results
@@ -947,6 +1194,18 @@ def main() -> None:
         default=35,
         help="Maximum candidate matches preserved per query in blocking (default: 35)",
     )
+    parser.add_argument(
+        "--sweep-sample-s1",
+        type=int,
+        default=50_000,
+        help="Train S1 entities used by the hyperparameter sweep (val uses a quarter as many); "
+        "0 = use the full Fold-0 split",
+    )
+    parser.add_argument(
+        "--exclusive-targets",
+        action="store_true",
+        help="Apply one-owner-per-target post-processing to the final OOF predictions",
+    )
     args = parser.parse_args()
 
     rep_dir = Path(args.reports_dir)
@@ -966,6 +1225,8 @@ def main() -> None:
         sample_s1=args.sample_s1,
         n_jobs=args.n_jobs,
         max_candidates=args.max_candidates,
+        exclusive_targets=args.exclusive_targets,
+        sweep_sample_s1=args.sweep_sample_s1 or None,
     )
 
 

@@ -16,7 +16,10 @@ import numpy as np
 import pandas as pd
 
 from parallax.features.extractor import FEATURE_COLUMNS
-from parallax.metrics.evaluator import evaluate_resolution_predictions
+from parallax.metrics.evaluator import (
+    evaluate_resolution_predictions,
+    macro_f05_threshold_scan,
+)
 
 
 class LightGBMMatcher:
@@ -77,18 +80,14 @@ class LightGBMMatcher:
         if self.num_threads is not None and self.num_threads > 0:
             params["num_threads"] = self.num_threads
 
-        valid_sets = [train_data]
-        if val_df is not None:
-            x_val = val_df[self.feature_columns]
-            y_val = val_df["target"].astype(int)
-            val_data = lgb.Dataset(x_val, label=y_val, reference=train_data)
-            valid_sets.append(val_data)
-
+        # No early stopping or eval logging is used, so validation sets would only burn
+        # CPU computing per-round logloss (including over the full training set).
+        # val_df is accepted for API compatibility; the trained booster is identical.
+        _ = val_df
         self.model = lgb.train(
             params,
             train_data,
             num_boost_round=self.n_estimators,
-            valid_sets=valid_sets,
         )
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
@@ -96,7 +95,10 @@ class LightGBMMatcher:
         if self.model is None:
             raise RuntimeError("Model has not been trained yet.")
         x = df[self.feature_columns]
-        preds = self.model.predict(x)
+        if self.num_threads is not None and self.num_threads > 0:
+            preds = self.model.predict(x, num_threads=self.num_threads)
+        else:
+            preds = self.model.predict(x)
         return np.asarray(preds, dtype=np.float64)
 
     def optimize_threshold(
@@ -110,6 +112,23 @@ class LightGBMMatcher:
         Returns (best_threshold, best_macro_f05).
         """
         probs = self.predict_proba(val_df)
+        if "target" in val_df.columns:
+            scores = macro_f05_threshold_scan(
+                val_df["s1_id"].to_numpy(),
+                val_df["target"].to_numpy().astype(bool),
+                probs,
+                val_gt,
+                list(search_range),
+            )
+            best_tau = self.decision_threshold
+            best_score = -1.0
+            for tau, sc in zip(search_range, scores, strict=True):
+                if sc > best_score:
+                    best_score = sc
+                    best_tau = float(tau)
+            self.decision_threshold = best_tau
+            return best_tau, best_score
+
         df_eval = val_df[["s1_id", "cand_id"]].copy()
         df_eval["prob"] = probs
 
