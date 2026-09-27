@@ -22,24 +22,96 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
 
 # Add src and local scripts to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from parallax.data.contracts import load_ground_truth_dict
-from parallax.metrics.evaluator import evaluate_resolution_predictions
-from parallax.postprocessing.singleton_gate import SingletonGatedPredictor
-from build_pairwise_features import BASELINE_28_FEATURES
+from build_pairwise_features import BASELINE_28_FEATURES  # noqa: E402
+
+from parallax.data.contracts import load_ground_truth_dict  # noqa: E402
+from parallax.metrics.evaluator import evaluate_resolution_predictions  # noqa: E402
+from parallax.postprocessing.singleton_gate import SingletonGatedPredictor  # noqa: E402
+
+CONCAT_FEATURES = [
+    "concat_stem_similarity",
+    "concat_addr_product",
+    "concat_postal_product",
+]
+
+DOMAIN_FEATURES = [
+    "domain_stem_similarity",
+    "domain_addr_concordance",
+    "domain_postal_concordance",
+    "has_domain_target",
+]
+
+NEURAL_FEATURES = [
+    "indicxlit_name_similarity",
+    "has_indicxlit_name",
+    "qwen_name_cosine",
+]
 
 EXPERIMENT_FEATURE_SETS: dict[str, list[str]] = {
     "E0": BASELINE_28_FEATURES,
     "E1": BASELINE_28_FEATURES + ["indicxlit_name_similarity", "has_indicxlit_name"],
     "E2": BASELINE_28_FEATURES + ["qwen_name_cosine"],
-    "E3": BASELINE_28_FEATURES + ["indicxlit_name_similarity", "has_indicxlit_name", "qwen_name_cosine"],
+    "E3": BASELINE_28_FEATURES + NEURAL_FEATURES,
+    "D1": BASELINE_28_FEATURES + CONCAT_FEATURES,
+    "D2": BASELINE_28_FEATURES + DOMAIN_FEATURES,
+    "D3": BASELINE_28_FEATURES + CONCAT_FEATURES + DOMAIN_FEATURES + ["has_handle_target"],
+    "E4": BASELINE_28_FEATURES
+    + NEURAL_FEATURES
+    + CONCAT_FEATURES
+    + DOMAIN_FEATURES
+    + ["has_handle_target"],
 }
+
+
+def verify_feature_integrity() -> None:
+    """Rigorous feature integrity assertions and printing for all experimental arms."""
+    expected_counts = {
+        "E0": 28,
+        "D1": 31,
+        "D2": 32,
+        "D3": 36,
+        "E4": 39,
+    }
+
+    print("\n========================================================")
+    print("FEATURE INTEGRITY VERIFICATION ACROSS ARMS")
+    print("========================================================")
+
+    for arm, expected in expected_counts.items():
+        actual = len(EXPERIMENT_FEATURE_SETS[arm])
+        assert actual == expected, (
+            f"Arm {arm} feature count mismatch: expected {expected}, got {actual}!"
+        )
+        print(f"[{arm}] Total Features: {actual} (matches expected {expected})")
+        print(f"      Feature List ({actual}):\n      {EXPERIMENT_FEATURE_SETS[arm]}\n")
+
+    # Assert every E4 feature is strictly from baseline 28, E3 neural, or D3 deterministic
+    e4_features = EXPERIMENT_FEATURE_SETS["E4"]
+    e4_set = set(e4_features)
+    valid_allowed = (
+        set(BASELINE_28_FEATURES) | set(NEURAL_FEATURES) | set(EXPERIMENT_FEATURE_SETS["D3"])
+    )
+    unallowed = e4_set - valid_allowed
+    assert len(unallowed) == 0, f"Unallowed features detected in E4: {unallowed}"
+    assert len(e4_set) == 39, f"Duplicate features detected in E4: {len(e4_set)} unique vs 39 total"
+
+    # Assert D3 contains all D1 and D2 features plus handle
+    d3_set = set(EXPERIMENT_FEATURE_SETS["D3"])
+    assert set(EXPERIMENT_FEATURE_SETS["D1"]).issubset(d3_set), "D1 features missing from D3!"
+    assert set(EXPERIMENT_FEATURE_SETS["D2"]).issubset(d3_set), "D2 features missing from D3!"
+    assert "has_handle_target" in d3_set, "has_handle_target missing from D3!"
+
+    print("All feature integrity assertions PASSED successfully!")
+    print(
+        "E4 is strictly composed of baseline 28, the 3 tested E3 neural features, and D3 deterministic features."
+    )
+    print("========================================================\n")
 
 
 @dataclass
@@ -76,6 +148,10 @@ class ExperimentResult:
     cross_script_tps_recovered: int
     new_false_merges_vs_e0: int
     recovered_fns_vs_e0: int
+    new_singleton_violations_vs_e0: int
+    recovered_domain_fns: int
+    recovered_concat_fns: int
+    recovered_handle_fns: int
     total_train_time: float
     total_infer_time: float
     fold_results: list[FoldResult]
@@ -175,14 +251,18 @@ def run_experiment_arm(
 ) -> tuple[ExperimentResult, dict[str, set[str]]]:
     """Run full 5-fold cross-validation for a given experimental arm."""
     feature_cols = EXPERIMENT_FEATURE_SETS[arm]
-    print(f"\n========================================================")
-    print(f"RUNNING ARM {arm}: {len(feature_cols)} features ({', '.join(feature_cols[-2:] if len(feature_cols)>28 else ['Baseline'])})")
-    print(f"========================================================")
+    print("\n========================================================")
+    print(
+        f"RUNNING ARM {arm}: {len(feature_cols)} features ({', '.join(feature_cols[-2:] if len(feature_cols) > 28 else ['Baseline'])})"
+    )
+    print("========================================================")
 
     # Merge fold assignments into features dataframe
     entity_col = "entity_id" if "entity_id" in cv_folds_df.columns else "s1_id"
     s1_to_fold = dict(zip(cv_folds_df[entity_col].astype(str), cv_folds_df["fold"], strict=False))
-    s1_fold_arr = np.array([s1_to_fold.get(str(s), -1) for s in augmented_df["s1_id"]], dtype=np.int32)
+    s1_fold_arr = np.array(
+        [s1_to_fold.get(str(s), -1) for s in augmented_df["s1_id"]], dtype=np.int32
+    )
 
     fold_results: list[FoldResult] = []
     all_oof_preds: dict[str, set[str]] = {}
@@ -205,8 +285,8 @@ def run_experiment_arm(
         all_oof_preds.update(fold_preds)
 
         print(
-            f"Fold {k}: F0.5={res.macro_f05:.4f} | Prec={res.precision*100:.2f}% | "
-            f"Rec={res.recall*100:.2f}% | SingAcc={res.singleton_acc*100:.2f}% | tau={res.optimal_tau:.2f}"
+            f"Fold {k}: F0.5={res.macro_f05:.4f} | Prec={res.precision * 100:.2f}% | "
+            f"Rec={res.recall * 100:.2f}% | SingAcc={res.singleton_acc * 100:.2f}% | tau={res.optimal_tau:.2f}"
         )
 
     # Overall OOF Evaluation
@@ -227,7 +307,8 @@ def run_experiment_arm(
     blocking_fns = total_ground_truth_pairs - total_true_in_data
     false_merges = full_report.total_predicted_pairs - total_tps
     singleton_violations = sum(
-        1 for s1, gt_set in ground_truth.items()
+        1
+        for s1, gt_set in ground_truth.items()
         if len(gt_set) == 0 and len(all_oof_preds.get(s1, set())) > 0
     )
 
@@ -237,7 +318,9 @@ def run_experiment_arm(
     if has_indic_col:
         cs_mask = (augmented_df["target"] == 1) & (augmented_df[has_indic_col] == 1.0)
     else:
-        cs_mask = (augmented_df["target"] == 1) & (augmented_df["indicxlit_name_similarity"].notna())
+        cs_mask = (augmented_df["target"] == 1) & (
+            augmented_df["indicxlit_name_similarity"].notna()
+        )
     cs_pairs = augmented_df[cs_mask][["s1_id", "cand_id"]]
     cs_recovered = 0
     for s1, cand in zip(cs_pairs["s1_id"], cs_pairs["cand_id"], strict=False):
@@ -247,14 +330,55 @@ def run_experiment_arm(
     # Comparative deltas vs E0
     new_fm = 0
     recovered_fn = 0
+    new_sing_viol = 0
+    recov_domain = 0
+    recov_concat = 0
+    recov_handle = 0
+
     if e0_oof_preds is not None:
+        recov_pair_keys: set[tuple[str, str]] = set()
         for s1, preds in all_oof_preds.items():
             e0_preds = e0_oof_preds.get(s1, set())
             gt_set = ground_truth.get(s1, set())
             # New false merges: predicted in arm, not in e0, and not in gt
             new_fm += len((preds - e0_preds) - gt_set)
             # Recovered FNs: predicted in arm, in gt, but was not in e0
-            recovered_fn += len((preds & gt_set) - e0_preds)
+            rec_set = (preds & gt_set) - e0_preds
+            recovered_fn += len(rec_set)
+            for cand in rec_set:
+                recov_pair_keys.add((str(s1), str(cand)))
+
+            # New singleton violations vs E0
+            is_e0_viol = len(gt_set) == 0 and len(e0_preds) > 0
+            is_arm_viol = len(gt_set) == 0 and len(preds) > 0
+            if is_arm_viol and not is_e0_viol:
+                new_sing_viol += 1
+
+        # Attribution analysis on recovered positive pairs
+        if recov_pair_keys:
+            s1_arr = augmented_df["s1_id"].astype(str).tolist()
+            cand_arr = augmented_df["cand_id"].astype(str).tolist()
+            sub_mask = [(s, c) in recov_pair_keys for s, c in zip(s1_arr, cand_arr, strict=False)]
+            recov_df = augmented_df[sub_mask]
+
+            if "has_domain_target" in recov_df.columns:
+                dom_sim_col = (
+                    recov_df["domain_stem_similarity"]
+                    if "domain_stem_similarity" in recov_df.columns
+                    else 0.0
+                )
+                recov_domain = int(
+                    ((recov_df["has_domain_target"] == 1.0) & (dom_sim_col >= 0.70)).sum()
+                )
+            if "concat_stem_similarity" in recov_df.columns:
+                raw_ratio_col = (
+                    recov_df["raw_name_ratio"] if "raw_name_ratio" in recov_df.columns else 1.0
+                )
+                recov_concat = int(
+                    ((recov_df["concat_stem_similarity"] >= 0.75) & (raw_ratio_col < 0.65)).sum()
+                )
+            if "has_handle_target" in recov_df.columns:
+                recov_handle = int((recov_df["has_handle_target"] == 1.0).sum())
 
     exp_result = ExperimentResult(
         arm=arm,
@@ -276,6 +400,10 @@ def run_experiment_arm(
         cross_script_tps_recovered=int(cs_recovered),
         new_false_merges_vs_e0=int(new_fm),
         recovered_fns_vs_e0=int(recovered_fn),
+        new_singleton_violations_vs_e0=int(new_sing_viol),
+        recovered_domain_fns=int(recov_domain),
+        recovered_concat_fns=int(recov_concat),
+        recovered_handle_fns=int(recov_handle),
         total_train_time=float(sum(r.train_time for r in fold_results)),
         total_infer_time=float(sum(r.infer_time for r in fold_results)),
         fold_results=fold_results,
@@ -283,8 +411,8 @@ def run_experiment_arm(
 
     print(
         f"\n>>> ARM {arm} MEAN: F0.5 = {exp_result.macro_f05_mean:.4f} ± {exp_result.macro_f05_std:.4f} | "
-        f"Prec = {exp_result.precision_mean*100:.2f}% | Rec = {exp_result.recall_mean*100:.2f}% | "
-        f"SingAcc = {exp_result.singleton_acc_mean*100:.2f}%"
+        f"Prec = {exp_result.precision_mean * 100:.2f}% | Rec = {exp_result.recall_mean * 100:.2f}% | "
+        f"SingAcc = {exp_result.singleton_acc_mean * 100:.2f}%"
     )
     return exp_result, all_oof_preds
 
@@ -294,105 +422,133 @@ def generate_experiment_report(
     augmented_df: pd.DataFrame,
     report_path: Path,
 ) -> None:
-    """Generate comprehensive markdown report comparing E0 - E3."""
+    """Generate comprehensive markdown report comparing experimental arms against baseline."""
     report_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Feature correlations
-    tp_df = augmented_df[augmented_df["target"] == 1]
-    rho_qwen_soft, _ = pearsonr(tp_df["qwen_name_cosine"], tp_df["soft_name_ratio"])
-
-    # Filter to positive pairs where Indic transliteration was applicable (non-NaN)
-    ix_mask = tp_df["indicxlit_name_similarity"].notna()
-    if ix_mask.sum() > 2:
-        rho_ix_soft, _ = pearsonr(
-            tp_df.loc[ix_mask, "indicxlit_name_similarity"],
-            tp_df.loc[ix_mask, "soft_name_ratio"],
-        )
-        rho_qwen_ix, _ = pearsonr(
-            tp_df.loc[ix_mask, "qwen_name_cosine"],
-            tp_df.loc[ix_mask, "indicxlit_name_similarity"],
-        )
-    else:
-        rho_ix_soft = 0.0
-        rho_qwen_ix = 0.0
 
     e0 = results[0]
 
     md: list[str] = [
-        "# Parallax Neural Representation Experiment Report (E0–E3)",
+        "# Parallax Representation Experiment Report",
         f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "**Validation:** 5-Fold Stratified CV on Source 1 entities",
         "",
-        "## 1. Executive Summary & Metric Comparison",
+        "## 1. Executive Summary & Primary Metric Comparison",
         "",
-        "| Arm | Description | Features | Macro F0.5 | Δ F0.5 | Precision | Recall | Singleton Acc | Class. FNs | False Merges | Recov. FNs | New FMs |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Arm | Features | Macro F0.5 (mean ± std) | Precision | Recall | Singleton Acc | Class. FNs | Blocking FNs | False Merges | Sing. Violations |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     for r in results:
-        delta = f"{r.macro_f05_mean - e0.macro_f05_mean:+.4f}" if r.arm != "E0" else "BASELINE"
         md.append(
-            f"| **{r.arm}** | {r.description} | {r.feature_count} | **{r.macro_f05_mean:.4f} ± {r.macro_f05_std:.4f}** | "
-            f"**{delta}** | {r.precision_mean*100:.2f}% | {r.recall_mean*100:.2f}% | {r.singleton_acc_mean*100:.2f}% | "
-            f"{r.classification_fns:,} | {r.false_merges:,} | {r.recovered_fns_vs_e0} | {r.new_false_merges_vs_e0} |"
+            f"| **{r.arm}** | {r.feature_count} | **{r.macro_f05_mean:.4f} ± {r.macro_f05_std:.4f}** | "
+            f"{r.precision_mean * 100:.2f}% | {r.recall_mean * 100:.2f}% | {r.singleton_acc_mean * 100:.2f}% | "
+            f"{r.classification_fns:,} | {r.blocking_fns:,} | {r.false_merges:,} | {r.singleton_violations:,} |"
         )
 
-    md.extend([
-        "",
-        "## 2. Feature Redundancy & Correlation Analysis",
-        "",
-        "Measured on Positive Candidate Pairs (True Matches):",
-        f"- $\\rho(\\text{{qwen\\_name\\_cosine}}, \\text{{soft\\_name\\_ratio}}) = \\mathbf{{{rho_qwen_soft:.4f}}}$",
-        f"- $\\rho(\\text{{indicxlit\\_name\\_similarity}}, \\text{{soft\\_name\\_ratio}}) = \\mathbf{{{rho_ix_soft:.4f}}}$",
-        f"- $\\rho(\\text{{qwen\\_name\\_cosine}}, \\text{{indicxlit\\_name\\_similarity}}) = \\mathbf{{{rho_qwen_ix:.4f}}}$",
-        "",
-        "> [!NOTE]",
-        "> A correlation $\\rho < 0.85$ confirms non-redundancy with the baseline lexical feature.",
-        "",
-        "## 3. Fold-by-Fold Stability",
-        "",
-        "| Fold | E0 F0.5 | E1 F0.5 | E2 F0.5 | E3 F0.5 | E0 tau | E1 tau | E2 tau | E3 tau |",
-        "|---|---|---|---|---|---|---|---|---|",
-    ])
+    md.extend(
+        [
+            "",
+            "## 2. Direct Comparison Against Baseline E0",
+            "",
+            "| Arm | Δ Macro F0.5 | Δ Precision | Δ Recall | Δ Sing. Acc | Class. FNs Recov. | Block. FNs Recov. | Addl False Merges | Addl Sing. Violations |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+    )
+
+    for r in results:
+        if r.arm == "E0":
+            md.append(
+                "| **E0** | *BASELINE* | *BASELINE* | *BASELINE* | *BASELINE* | *BASELINE* | *BASELINE* | *BASELINE* | *BASELINE* |"
+            )
+        else:
+            delta_f05 = f"{r.macro_f05_mean - e0.macro_f05_mean:+.4f}"
+            delta_prec = f"{(r.precision_mean - e0.precision_mean) * 100:+.2f}%"
+            delta_rec = f"{(r.recall_mean - e0.recall_mean) * 100:+.2f}%"
+            delta_sing = f"{(r.singleton_acc_mean - e0.singleton_acc_mean) * 100:+.2f}%"
+            md.append(
+                f"| **{r.arm}** | **{delta_f05}** | {delta_prec} | {delta_rec} | {delta_sing} | "
+                f"+{r.recovered_fns_vs_e0} | 0 (Frozen Blocker) | {r.new_false_merges_vs_e0} | {r.new_singleton_violations_vs_e0} |"
+            )
+
+    md.extend(
+        [
+            "",
+            "## 3. Error Recovery Attribution Breakdown",
+            "",
+            "| Arm | Total FNs Recovered | Attributable to Domain Stem | Attributable to Concat Stem | Attributable to Handle | Other/Drift |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+
+    for r in results:
+        if r.arm == "E0":
+            continue
+        other = max(
+            0,
+            r.recovered_fns_vs_e0
+            - (r.recovered_domain_fns + r.recovered_concat_fns + r.recovered_handle_fns),
+        )
+        md.append(
+            f"| **{r.arm}** | {r.recovered_fns_vs_e0} | {r.recovered_domain_fns} | {r.recovered_concat_fns} | {r.recovered_handle_fns} | {other} |"
+        )
+
+    arms = [r.arm for r in results]
+    header_f05 = " | ".join(f"{a} F0.5" for a in arms)
+    header_tau = " | ".join(f"{a} tau" for a in arms)
+    md.extend(
+        [
+            "",
+            "## 4. Fold-by-Fold Stability",
+            "",
+            f"| Fold | {header_f05} | {header_tau} |",
+            f"|{'---|' * (1 + 2 * len(arms))}",
+        ]
+    )
 
     for k in range(5):
-        f0_e0 = results[0].fold_results[k].macro_f05
-        f0_e1 = results[1].fold_results[k].macro_f05
-        f0_e2 = results[2].fold_results[k].macro_f05
-        f0_e3 = results[3].fold_results[k].macro_f05
-        t_e0 = results[0].fold_results[k].optimal_tau
-        t_e1 = results[1].fold_results[k].optimal_tau
-        t_e2 = results[2].fold_results[k].optimal_tau
-        t_e3 = results[3].fold_results[k].optimal_tau
-        md.append(f"| {k} | {f0_e0:.4f} | {f0_e1:.4f} | {f0_e2:.4f} | {f0_e3:.4f} | {t_e0:.2f} | {t_e1:.2f} | {t_e2:.2f} | {t_e3:.2f} |")
+        f0_vals = " | ".join(f"{r.fold_results[k].macro_f05:.4f}" for r in results)
+        t_vals = " | ".join(f"{r.fold_results[k].optimal_tau:.2f}" for r in results)
+        md.append(f"| {k} | {f0_vals} | {t_vals} |")
 
-    md.extend([
-        "",
-        "## 4. Decision Gate Evaluation",
-        "",
-    ])
+    md.extend(
+        [
+            "",
+            "## 5. Multi-Metric Decision Gate Evaluation",
+            "",
+        ]
+    )
 
-    # Check promotion criteria
-    best_arm = max(results[1:], key=lambda x: x.macro_f05_mean)
-    delta_best = best_arm.macro_f05_mean - e0.macro_f05_mean
+    # Multi-metric promotion evaluation (no arbitrary CFN cutoffs)
+    if len(results) > 1:
+        best_arm = max(results[1:], key=lambda x: x.macro_f05_mean)
+        delta_best = best_arm.macro_f05_mean - e0.macro_f05_mean
+        delta_fm = best_arm.new_false_merges_vs_e0
+        delta_cfn = e0.classification_fns - best_arm.classification_fns
 
-    if delta_best >= 0.0020 and best_arm.singleton_acc_mean >= (e0.singleton_acc_mean - 0.005):
-        md.append(
-            f"**STATUS: ACCEPT / PROMOTE {best_arm.arm}**\n\n"
-            f"Arm {best_arm.arm} achieved Macro F0.5 gain of **{delta_best:+.4f}** (clearing the +0.0020 significance bar) "
-            f"while preserving singleton accuracy at {best_arm.singleton_acc_mean*100:.2f}%."
-        )
-    elif delta_best > 0:
-        md.append(
-            f"**STATUS: MARGINAL / INCONCLUSIVE**\n\n"
-            f"Arm {best_arm.arm} gained {delta_best:+.4f}, which is within fold noise (std={best_arm.macro_f05_std:.4f}). "
-            f"Do not promote to 200K without further feature refinement."
-        )
+        if (
+            delta_best >= 0.0020
+            and best_arm.singleton_acc_mean >= (e0.singleton_acc_mean - 0.005)
+            and delta_fm <= 15
+        ):
+            md.append(
+                f"**STATUS: ACCEPT / PROMOTE {best_arm.arm}**\n\n"
+                f"Arm {best_arm.arm} achieved Macro F0.5 gain of **{delta_best:+.4f}** (clearing +0.0020 bar), "
+                f"recovered {delta_cfn} classification FNs with only {delta_fm} new false merges, "
+                f"while preserving singleton accuracy at {best_arm.singleton_acc_mean * 100:.2f}%."
+            )
+        elif delta_best > 0:
+            md.append(
+                f"**STATUS: MARGINAL / INCONCLUSIVE**\n\n"
+                f"Arm {best_arm.arm} gained {delta_best:+.4f}, within fold noise (std={best_arm.macro_f05_std:.4f}). "
+                f"Requires further validation before promotion."
+            )
+        else:
+            md.append(
+                f"**STATUS: REJECT**\n\n"
+                f"No evaluated arm beat the baseline Macro F0.5 of {e0.macro_f05_mean:.4f}."
+            )
     else:
-        md.append(
-            f"**STATUS: REJECT**\n\n"
-            f"No neural feature configuration beat the baseline Macro F0.5 of {e0.macro_f05_mean:.4f}."
-        )
+        md.append("**STATUS: BASELINE EVALUATION ONLY**")
 
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(md))
@@ -401,13 +557,55 @@ def generate_experiment_report(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Parallax Neural Representation Experiments E0 - E3")
-    parser.add_argument("--augmented-features", type=Path, default=Path("experiments/neural_text/caches/augmented_features_5k.parquet"))
-    parser.add_argument("--cv-folds", type=Path, default=Path("data/medium_split_200k/cv_folds_source1.tsv"))
-    parser.add_argument("--ground-truth", type=Path, default=Path("data/medium_split_200k/train_ground_truth.tsv"))
-    parser.add_argument("--output-report", type=Path, default=Path("experiments/neural_text/reports/neural_experiment_e0_e3_report.md"))
-    parser.add_argument("--output-json", type=Path, default=Path("experiments/neural_text/results/experiment_e0_e3_metrics.json"))
+    parser = argparse.ArgumentParser(
+        description="Run Parallax Representation Experiments (E0, D1-D3, E4)"
+    )
+    parser.add_argument(
+        "--augmented-features",
+        type=Path,
+        default=Path(
+            "experiments/neural_text/caches/augmented_features_with_concordance_5k.parquet"
+        ),
+    )
+    parser.add_argument(
+        "--cv-folds", type=Path, default=Path("data/medium_split_200k/cv_folds_source1.tsv")
+    )
+    parser.add_argument(
+        "--ground-truth", type=Path, default=Path("data/medium_split_200k/train_ground_truth.tsv")
+    )
+    parser.add_argument(
+        "--output-report",
+        type=Path,
+        default=Path("experiments/neural_text/reports/experiment_ladder_report.md"),
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=Path("experiments/neural_text/results/experiment_ladder_metrics.json"),
+    )
+    parser.add_argument(
+        "--arms",
+        nargs="+",
+        default=["E0", "D1", "D2", "D3"],
+        help="Experimental arms to run",
+    )
+    parser.add_argument(
+        "--run-e4-if-promoted",
+        action="store_true",
+        help="Conditionally run E4 only if D3 demonstrates meaningful deterministic lift over E0",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Perform feature integrity verification and print complete lists without running CV",
+    )
     args = parser.parse_args()
+
+    # Feature integrity assertions and complete list printing
+    verify_feature_integrity()
+    if args.verify_only:
+        print("Feature verification completed successfully (--verify-only specified). Exiting.")
+        return
 
     print(f"Loading augmented features from: {args.augmented_features}")
     augmented_df = pd.read_parquet(args.augmented_features)
@@ -421,14 +619,18 @@ def main() -> None:
     # Schema normalization and strict fold verification
     entity_col = "entity_id" if "entity_id" in cv_folds_df.columns else "s1_id"
     present_s1 = set(augmented_df["s1_id"].astype(str).unique())
-    cv_folds_df = cv_folds_df[cv_folds_df[entity_col].astype(str).isin(present_s1)].reset_index(drop=True)
+    cv_folds_df = cv_folds_df[cv_folds_df[entity_col].astype(str).isin(present_s1)].reset_index(
+        drop=True
+    )
     gt_dict = {k: v for k, v in gt_dict.items() if k in present_s1}
 
     # Strict fold verification assertions
     assert len(cv_folds_df) == len(present_s1), (
         f"Fold count mismatch: {len(cv_folds_df)} fold assignments vs {len(present_s1)} entities in features!"
     )
-    assert cv_folds_df[entity_col].nunique() == len(cv_folds_df), "Duplicate entity IDs found in fold assignments!"
+    assert cv_folds_df[entity_col].nunique() == len(cv_folds_df), (
+        "Duplicate entity IDs found in fold assignments!"
+    )
     folds = sorted(cv_folds_df["fold"].unique())
     fold_counts = {f: int((cv_folds_df["fold"] == f).sum()) for f in folds}
     for f in folds:
@@ -439,7 +641,7 @@ def main() -> None:
     results: list[ExperimentResult] = []
     e0_preds: dict[str, set[str]] | None = None
 
-    for arm in ["E0", "E1", "E2", "E3"]:
+    for arm in args.arms:
         res, oof_preds = run_experiment_arm(
             arm=arm,
             augmented_df=augmented_df,
@@ -450,6 +652,25 @@ def main() -> None:
         if arm == "E0":
             e0_preds = oof_preds
         results.append(res)
+
+    # Conditional E4 execution
+    if args.run_e4_if_promoted and "D3" in args.arms and "E4" not in args.arms:
+        d3_res = next((r for r in results if r.arm == "D3"), None)
+        e0_res = next((r for r in results if r.arm == "E0"), None)
+        if d3_res and e0_res and d3_res.macro_f05_mean > e0_res.macro_f05_mean:
+            print("\n>>> D3 demonstrated positive deterministic lift! Running conditional E4...")
+            res_e4, _ = run_experiment_arm(
+                arm="E4",
+                augmented_df=augmented_df,
+                cv_folds_df=cv_folds_df,
+                ground_truth=gt_dict,
+                e0_oof_preds=e0_preds,
+            )
+            results.append(res_e4)
+        else:
+            print(
+                "\n>>> D3 did not beat E0 or was inconclusive; skipping E4 to preserve causal attribution."
+            )
 
     # Save metrics JSON
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
