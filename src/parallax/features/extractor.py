@@ -176,6 +176,17 @@ _CURRENT_TARGET_DF: pd.DataFrame | None = None
 _CURRENT_TARGET_LOOKUP: Mapping[str, Any] | None = None
 _CURRENT_CAND_ITEMS: list[tuple[str, Any]] | None = None
 _CURRENT_GT: Mapping[str, set[str]] | None = None
+_CURRENT_S1_INDEX: pd.Index | None = None
+_CURRENT_TARGET_INDEX: pd.Index | None = None
+
+
+def _rows_for_ids(df: pd.DataFrame, index: pd.Index | None, ids: set[str]) -> pd.DataFrame:
+    """Select rows of df whose entity_id is in ids via a prebuilt Index (no full-column scan)."""
+    if index is None or not index.is_unique:
+        return df
+    pos = index.get_indexer(list(ids))
+    pos = np.sort(pos[pos >= 0])
+    return df.iloc[pos].reset_index(drop=True)
 
 
 def _worker_extract_slice(bounds: tuple[int, int]) -> pd.DataFrame:
@@ -188,14 +199,19 @@ def _worker_extract_slice(bounds: tuple[int, int]) -> pd.DataFrame:
         raise RuntimeError("Worker process lost extractor context.")
     start, end = bounds
     chunk = dict(_CURRENT_CAND_ITEMS[start:end])
-    s1_dict = _CURRENT_EXTRACTOR.build_record_lookup(_CURRENT_S1_DF, needed_ids=set(chunk))
+    s1_ids = set(chunk)
+    s1_dict = _CURRENT_EXTRACTOR.build_record_lookup(
+        _rows_for_ids(_CURRENT_S1_DF, _CURRENT_S1_INDEX, s1_ids), needed_ids=s1_ids
+    )
     if _CURRENT_TARGET_LOOKUP is not None:
         target_dict: Mapping[str, Any] = _CURRENT_TARGET_LOOKUP
     else:
         if _CURRENT_TARGET_DF is None:
             raise RuntimeError("Worker process lost target context.")
         needed = {c for cands in chunk.values() for c in cands}
-        target_dict = _CURRENT_EXTRACTOR.build_record_lookup(_CURRENT_TARGET_DF, needed_ids=needed)
+        target_dict = _CURRENT_EXTRACTOR.build_record_lookup(
+            _rows_for_ids(_CURRENT_TARGET_DF, _CURRENT_TARGET_INDEX, needed), needed_ids=needed
+        )
     return _CURRENT_EXTRACTOR._extract_features_serial(
         chunk,
         s1_dict=s1_dict,
@@ -396,12 +412,21 @@ class PairwiseFeatureExtractor:
 
         global _CURRENT_EXTRACTOR, _CURRENT_S1_DF, _CURRENT_TARGET_DF
         global _CURRENT_TARGET_LOOKUP, _CURRENT_CAND_ITEMS, _CURRENT_GT
+        global _CURRENT_S1_INDEX, _CURRENT_TARGET_INDEX
         _CURRENT_EXTRACTOR = self
         _CURRENT_S1_DF = s1_df
         _CURRENT_TARGET_DF = target_df
         _CURRENT_TARGET_LOOKUP = target_lookup
         _CURRENT_CAND_ITEMS = list(candidate_pairs.items())
         _CURRENT_GT = ground_truth
+        _CURRENT_S1_INDEX = (
+            pd.Index(s1_df["entity_id"].astype(str)) if "entity_id" in s1_df else None
+        )
+        _CURRENT_TARGET_INDEX = (
+            pd.Index(target_df["entity_id"].astype(str))
+            if target_df is not None and "entity_id" in target_df
+            else None
+        )
         # 2x over-partitioning: balances stragglers while limiting duplicate lookup builds.
         tasks = chunk_bounds(len(_CURRENT_CAND_ITEMS), n_jobs * 2)
         pbar = tqdm(
@@ -427,6 +452,8 @@ class PairwiseFeatureExtractor:
             _CURRENT_TARGET_LOOKUP = None
             _CURRENT_CAND_ITEMS = None
             _CURRENT_GT = None
+            _CURRENT_S1_INDEX = None
+            _CURRENT_TARGET_INDEX = None
 
         return pd.concat(chunk_dfs, ignore_index=True)
 
