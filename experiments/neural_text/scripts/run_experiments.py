@@ -168,7 +168,9 @@ def train_and_eval_fold(
     seed: int = 42,
     threshold_grid: tuple[float, ...] = (0.60, 0.65, 0.70, 0.74, 0.78, 0.82, 0.86, 0.90),
 ) -> tuple[FoldResult, np.ndarray, dict[str, set[str]]]:
-    """Train LightGBM on fold, locate optimal tau, and evaluate out-of-fold."""
+    """Train LightGBM on fold, locate optimal tau via inner OOF, and evaluate out-of-fold."""
+    assert len(set(val_s1_ids).intersection(set(train_s1_ids))) == 0, "Outer val leakage!"
+
     x_train = train_df[feature_cols]
     y_train = train_df["target"].astype(int)
     x_val = val_df[feature_cols]
@@ -189,6 +191,46 @@ def train_and_eval_fold(
     }
 
     t0_train = time.time()
+    
+    # --- INNER CV FOR THRESHOLD SELECTION ---
+    inner_k = 3
+    s1_ids_unique = np.array(list(set(train_s1_ids)))
+    np.random.seed(seed)
+    np.random.shuffle(s1_ids_unique)
+    inner_folds = np.array_split(s1_ids_unique, inner_k)
+    
+    inner_oof_probs = np.zeros(len(train_df))
+    
+    # Determine the entity ID column correctly from the DataFrame
+    s1_col = "s1_id" if "s1_id" in train_df.columns else "entity_id"
+    
+    for i in range(inner_k):
+        inner_val_s1 = set(inner_folds[i])
+        inner_val_mask = train_df[s1_col].astype(str).isin(inner_val_s1)
+        
+        inner_train_df = train_df[~inner_val_mask]
+        inner_val_df = train_df[inner_val_mask]
+        
+        inner_train_data = lgb.Dataset(inner_train_df[feature_cols], label=inner_train_df["target"].astype(int))
+        inner_booster = lgb.train(params, inner_train_data, num_boost_round=100)
+        inner_oof_probs[inner_val_mask] = inner_booster.predict(inner_val_df[feature_cols])
+        
+    predictor = SingletonGatedPredictor()
+    train_eval_df = train_df[["s1_id", "cand_id"]].copy()
+    train_eval_df["prob"] = inner_oof_probs
+
+    best_tau = 0.74
+    best_score = -1.0
+
+    for tau in threshold_grid:
+        preds = predictor.filter_predictions(train_eval_df, train_s1_ids, threshold=tau)
+        rep = evaluate_resolution_predictions(train_gt, preds)
+        # Deterministic tie-breaking: prefer higher tau for lower False Positives
+        if rep.macro_f05 > best_score or (rep.macro_f05 == best_score and tau > best_tau):
+            best_score = rep.macro_f05
+            best_tau = tau
+
+    # --- FINAL OUTER MODEL ---
     booster = lgb.train(
         params,
         train_data,
@@ -198,24 +240,8 @@ def train_and_eval_fold(
     train_time = time.time() - t0_train
 
     t0_infer = time.time()
-    train_probs = booster.predict(x_train)
     probs = booster.predict(x_val)
     infer_time = time.time() - t0_infer
-
-    # Threshold optimization on TRAIN set
-    predictor = SingletonGatedPredictor()
-    train_eval_df = train_df[["s1_id", "cand_id"]].copy()
-    train_eval_df["prob"] = train_probs
-
-    best_tau = 0.74
-    best_score = -1.0
-
-    for tau in threshold_grid:
-        preds = predictor.filter_predictions(train_eval_df, train_s1_ids, threshold=tau)
-        rep = evaluate_resolution_predictions(train_gt, preds)
-        if rep.macro_f05 > best_score:
-            best_score = rep.macro_f05
-            best_tau = tau
 
     # Evaluate on VALIDATION set using chosen tau
     val_eval_df = val_df[["s1_id", "cand_id"]].copy()
@@ -245,6 +271,9 @@ def train_and_eval_fold(
         train_time=train_time,
         infer_time=infer_time,
     )
+    
+    print(f"  Inner-OOF Threshold Selection: tau={best_tau:.2f} | inner_oof_f05={best_score:.4f}")
+    
     return result, probs, best_preds
 
 
