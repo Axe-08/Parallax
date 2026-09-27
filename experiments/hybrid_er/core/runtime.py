@@ -39,14 +39,43 @@ def select_device(requested: str = "auto") -> str:
             raise RuntimeError(f"GPU {idx} requested but only {torch.cuda.device_count()} devices exist.")
         return f"cuda:{idx}"
 
-    best, best_free = 0, -1
-    for i in range(torch.cuda.device_count()):
-        free_b, total_b = torch.cuda.mem_get_info(i)
-        logger.info("GPU %d: %.2f GiB free / %.2f GiB total", i, free_b / 2**30, total_b / 2**30)
-        if free_b > best_free:
-            best, best_free = i, free_b
-    logger.info("Selected cuda:%d (%.2f GiB free)", best, best_free / 2**30)
+    free = _nvidia_smi_free_mib()
+    if free is None:  # fall back to CUDA queries (creates a context per device)
+        free = {}
+        for i in range(torch.cuda.device_count()):
+            try:
+                free[i] = torch.cuda.mem_get_info(i)[0] / 2**20
+            except RuntimeError as exc:  # a completely full shared GPU cannot even host a context
+                logger.warning("GPU %d unavailable: %s", i, exc)
+    if not free:
+        raise RuntimeError("No usable CUDA device found.")
+    for i, f in sorted(free.items()):
+        logger.info("GPU %d: %.2f GiB free", i, f / 1024)
+    best = max(free, key=free.get)
+    logger.info("Selected cuda:%d (%.2f GiB free)", best, free[best] / 1024)
     return f"cuda:{best}"
+
+
+def _nvidia_smi_free_mib() -> dict[int, float] | None:
+    """Free MiB per visible GPU without creating CUDA contexts (None if nvidia-smi is unusable)."""
+    import os
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout
+    except Exception:
+        return None
+    phys = {int(a): float(b) for a, b in (line.split(",") for line in out.strip().splitlines())}
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return phys
+    try:
+        order = [int(x) for x in visible.split(",") if x.strip()]
+    except ValueError:  # UUID-style masks: let torch decide
+        return None
+    return {logical: phys[p] for logical, p in enumerate(order) if p in phys}
 
 
 def device_info(device: str) -> dict[str, Any]:
