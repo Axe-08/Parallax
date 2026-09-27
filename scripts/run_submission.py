@@ -418,8 +418,17 @@ def stage_score(args: argparse.Namespace) -> None:
     mask = probs >= tau
     if not args.no_exclusive:
         cand_max = scored.groupby("cand_id")["prob"].transform("max").to_numpy()
-        excl = mask & (probs >= cand_max)
-        log(f"Exclusivity removed {int((mask & ~excl).sum()):,} contested pairs")
+        at_max = mask & (probs >= cand_max)
+        # A target tied at its max by several S1 (e.g. same-name records with an empty-address
+        # target) can belong to at most one of them: drop it rather than give k-1 false merges.
+        n_at_max = (
+            pd.Series(at_max, index=scored.index).groupby(scored["cand_id"]).transform("sum")
+        ).to_numpy()
+        excl = at_max & (n_at_max == 1)
+        log(
+            f"Exclusivity removed {int((mask & ~at_max).sum()):,} contested pairs and "
+            f"{int((at_max & ~excl).sum()):,} tied pairs"
+        )
         mask = excl
 
     s1_all = pd.read_parquet(work / "checkpoints" / "test_s1_wide.parquet", columns=["entity_id"])
