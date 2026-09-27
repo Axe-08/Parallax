@@ -2,7 +2,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-def merge_candidate_tables(candidate_dfs: list, e0_features_df: pd.DataFrame = None) -> pd.DataFrame:
+from typing import Set
+
+def merge_candidate_tables(candidate_dfs: list, e0_features_df: pd.DataFrame = None, s2_ids: Set[str] = None, s3_ids: Set[str] = None) -> pd.DataFrame:
     """
     Merges multiple candidate dataframes into a single deduplicated table.
     Each input dataframe MUST have:
@@ -19,6 +21,8 @@ def merge_candidate_tables(candidate_dfs: list, e0_features_df: pd.DataFrame = N
     found_by_bge, rank_bge, score_bge,
     etc.
     """
+    from experiments.hybrid_er.core.validation import validate_source_contract
+    
     if not candidate_dfs:
         return pd.DataFrame()
         
@@ -34,9 +38,8 @@ def merge_candidate_tables(candidate_dfs: list, e0_features_df: pd.DataFrame = N
             raise ValueError(f"Candidate DataFrame is missing required 'source' column. Columns: {list(d.columns)}")
             
         d['source'] = d['source'].astype(str)
-        invalid_sources = d[~d['source'].isin(['S2', 'S3'])]
-        if not invalid_sources.empty:
-            raise ValueError(f"Invalid source found in candidates. Allowed: 'S2', 'S3'. Found: {invalid_sources['source'].unique()}")
+        if s2_ids is not None and s3_ids is not None:
+            validate_source_contract(d, s2_ids, s3_ids)
             
         if 'blocker' not in d.columns:
             d['blocker'] = 'unknown'

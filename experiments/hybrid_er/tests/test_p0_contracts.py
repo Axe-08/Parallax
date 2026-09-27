@@ -16,7 +16,8 @@ from experiments.hybrid_er.core.validation import (
     validate_source_contract,
     validate_evaluation_population,
     validate_prediction_population,
-    validate_gt_contract
+    validate_gt_global_contract,
+    scope_ground_truth_to_eval
 )
 from experiments.hybrid_er.evaluation.metrics import evaluate_matcher_predictions
 from experiments.hybrid_er.core.cv import get_s1_grouped_folds
@@ -93,14 +94,33 @@ def test_gt_target_outside_s2_s3():
     s2_ids = {'s2_1'}
     s3_ids = {'s3_1'}
     with pytest.raises(ValueError, match="not in S2 or S3 populations"):
-        validate_gt_contract(gt, ['1'], s2_ids, s3_ids)
+        validate_gt_global_contract(gt, s2_ids, s3_ids)
 
 def test_gt_missing_eval_s1():
     gt = {'1': {'s2_1'}}
-    s2_ids = {'s2_1'}
+    with pytest.raises(ValueError, match="missing from global ground truth"):
+        scope_ground_truth_to_eval(gt, ['1', '2'])
+
+def test_global_gt_vs_eval_population():
+    # Simulate a global GT with 200k (here 4 for simplicity)
+    global_gt = {
+        '1': {'s2_1'},
+        '2': set(),
+        '3': {'s3_1'},
+        '4': {'s2_2'}
+    }
+    s2_ids = {'s2_1', 's2_2'}
     s3_ids = {'s3_1'}
-    with pytest.raises(ValueError, match="Missing 1 evaluation S1"):
-        validate_gt_contract(gt, ['1', '2'], s2_ids, s3_ids)
+    eval_s1_ids = ['1', '2']
+    
+    # Global GT validation must not fail because it has 4 elements and eval has 2
+    validate_gt_global_contract(global_gt, s2_ids, s3_ids)
+    
+    # Scoping must yield exactly 2
+    scoped = scope_ground_truth_to_eval(global_gt, eval_s1_ids)
+    assert set(scoped.keys()) == {'1', '2'}
+    assert scoped['1'] == {'s2_1'}
+    assert scoped['2'] == set()
 
 def test_evaluate_matcher_predictions_scoping():
     # Full GT has 200k, we evaluate only 2

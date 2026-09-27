@@ -17,7 +17,11 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 from parallax.data.contracts import load_ground_truth_dict
 
 # Internal imports
-from experiments.hybrid_er.core.validation import validate_candidate_schema, validate_source_contract, validate_evaluation_population, validate_gt_contract
+from experiments.hybrid_er.core.validation import (
+    validate_candidate_schema, validate_source_contract, 
+    validate_evaluation_population, validate_gt_global_contract,
+    scope_ground_truth_to_eval
+)
 from experiments.hybrid_er.evaluation.metrics import evaluate_candidate_recall, evaluate_matcher_predictions
 from experiments.hybrid_er.core.serialization import serialize_full, serialize_name_only, serialize_address_only
 from experiments.hybrid_er.retrieval.neural_bge import DenseRetriever, FaissIndexManager
@@ -92,7 +96,8 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     s3_ids = set(s3_df['entity_id'].astype(str))
     
     validate_evaluation_population(s1_df, eval_s1_ids)
-    validate_gt_contract(gt, eval_s1_ids, s2_ids, s3_ids)
+    validate_gt_global_contract(gt, s2_ids, s3_ids)
+    gt_eval = scope_ground_truth_to_eval(gt, eval_s1_ids)
     
     print("1. Running Structural Retrieval (Channel F)...")
     structural_cands = run_structural_retrieval(s1_df, s2_df, s3_df)
@@ -117,7 +122,7 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     validate_candidate_schema(e0_formatted)
     validate_source_contract(e0_formatted, s2_ids, s3_ids)
     
-    union_for_expansion = merge_candidate_tables([e0_formatted, structural_cands])
+    union_for_expansion = merge_candidate_tables([e0_formatted, structural_cands], s2_ids=s2_ids, s3_ids=s3_ids)
     # melt it back to list
     to_expand = union_for_expansion[['s1_id', 'source', 'cand_id']].copy()
     relational_cands = run_relational_expansion(to_expand, s2_s3_graph)
@@ -166,23 +171,23 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     # E0 is baseline
     e0_preds = {s: set(e0_cands[e0_cands['s1_id'] == s]['cand_id'].astype(str)) for s in eval_s1_ids}
     print("--- E0 Baseline ---")
-    print(evaluate_candidate_recall(gt, e0_preds, eval_s1_ids))
-    e0_eval = evaluate_matcher_predictions(gt, e0_preds, eval_s1_ids)
+    print(evaluate_candidate_recall(gt_eval, e0_preds, eval_s1_ids))
+    e0_eval = evaluate_matcher_predictions(gt_eval, e0_preds, eval_s1_ids)
     print(f"Matcher Macro F0.5: {e0_eval.macro_f05:.4f}\n")
     
     # E0 + BGE
-    e0_bge = merge_candidate_tables([e0_formatted, neural_cands_df])
+    e0_bge = merge_candidate_tables([e0_formatted, neural_cands_df], s2_ids=s2_ids, s3_ids=s3_ids)
     preds_bge = e0_bge.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
     print("--- E0 + BGE ---")
-    print(evaluate_candidate_recall(gt, preds_bge, eval_s1_ids))
-    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt, preds_bge, eval_s1_ids).macro_f05:.4f}\n")
+    print(evaluate_candidate_recall(gt_eval, preds_bge, eval_s1_ids))
+    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt_eval, preds_bge, eval_s1_ids).macro_f05:.4f}\n")
     
     # Full Union (E0 + BGE + E + F)
-    full_union = merge_candidate_tables([e0_formatted, neural_cands_df, structural_cands, relational_cands])
+    full_union = merge_candidate_tables([e0_formatted, neural_cands_df, structural_cands, relational_cands], s2_ids=s2_ids, s3_ids=s3_ids)
     preds_full = full_union.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
     print("--- E0 + BGE + E + F (FULL UNION) ---")
-    print(evaluate_candidate_recall(gt, preds_full, eval_s1_ids))
-    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt, preds_full, eval_s1_ids).macro_f05:.4f}\n")
+    print(evaluate_candidate_recall(gt_eval, preds_full, eval_s1_ids))
+    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt_eval, preds_full, eval_s1_ids).macro_f05:.4f}\n")
     
     print(f"6. Reranking Full Union (on {device})...")
     scored_union = run_reranking_on_candidates(full_union, s1_df, s2_df, s3_df, serialize_full, device=device)
@@ -191,8 +196,8 @@ def run_5k_pipeline(gpu: str = "auto", batch_size: int = 128):
     top_reranked = scored_union[scored_union['reranker_score'] > 0.0]
     preds_reranked = top_reranked.groupby('s1_id')['cand_id'].apply(lambda x: set(x)).to_dict()
     print("--- + Reranker (Naive > 0) ---")
-    print(evaluate_candidate_recall(gt, preds_reranked, eval_s1_ids))
-    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt, preds_reranked, eval_s1_ids).macro_f05:.4f}\n")
+    print(evaluate_candidate_recall(gt_eval, preds_reranked, eval_s1_ids))
+    print(f"Matcher Macro F0.5: {evaluate_matcher_predictions(gt_eval, preds_reranked, eval_s1_ids).macro_f05:.4f}\n")
     
     print("7. Meta-Blocker Compression Evaluation...")
     # Train dummy meta-blocker (now using is_match correctly via GT later)

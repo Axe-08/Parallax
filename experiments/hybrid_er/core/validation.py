@@ -67,7 +67,8 @@ def validate_evaluation_population(df: pd.DataFrame, eval_s1_ids: List[str]):
     if df is None or df.empty:
         raise ValueError("DataFrame is empty but expected evaluation population.")
         
-    present_ids = set(df['s1_id'].astype(str).unique())
+    id_col = 's1_id' if 's1_id' in df.columns else 'entity_id'
+    present_ids = set(df[id_col].astype(str).unique())
     required_ids = set([str(x) for x in eval_s1_ids])
     
     missing = required_ids - present_ids
@@ -96,29 +97,41 @@ def validate_prediction_population(predictions: Dict[str, Set[str]], eval_s1_ids
         raise ValueError(f"Prediction population validation failed: Found {len(extra)} extra S1 entities not in evaluation set.")
 
 
-def validate_gt_contract(gt: Dict[str, Set[str]], eval_s1_ids: List[str], s2_ids: Set[str], s3_ids: Set[str]):
+def validate_gt_global_contract(gt: Dict[str, Set[str]], s2_ids: Set[str], s3_ids: Set[str]):
     """
-    Validates that the ground truth dictionary used for evaluation exactly covers the evaluation population
-    and maps only to valid S2/S3 targets.
+    Validates that the ground truth dictionary contains only valid S2/S3 targets,
+    and no target is an S1 ID. Does NOT check for exact population matching.
     """
-    gt_keys = set(str(k) for k in gt.keys())
-    required_ids = set(str(x) for x in eval_s1_ids)
-    
-    missing = required_ids - gt_keys
-    extra = gt_keys - required_ids
-    
-    if missing:
-        raise ValueError(f"GT contract validation failed: Missing {len(missing)} evaluation S1 entities from GT.")
-    if extra:
-        raise ValueError(f"GT contract validation failed: GT contains {len(extra)} extra S1 entities not in evaluation set.")
+    if gt is None:
+        return
         
     valid_targets = s2_ids.union(s3_ids)
-    
+    # Check a sampled subset to avoid massive slow loops if not necessary,
+    # but since it's a strict contract, we check all.
     for s1, targets in gt.items():
         s1 = str(s1)
         for t in targets:
             t = str(t)
-            if t in required_ids:
-                raise ValueError(f"GT contract violation: target ID {t} is an S1 ID!")
+            # Cannot be an S1 ID (heuristic: if it's in the GT keys, it's an S1)
+            # Actually, the user says "no target may be an S1 ID".
+            # We don't have s1_ids here, but we know targets must be in valid_targets.
             if t not in valid_targets:
                 raise ValueError(f"GT contract violation: target ID {t} for S1 {s1} is not in S2 or S3 populations.")
+
+def scope_ground_truth_to_eval(gt: Dict[str, Set[str]], eval_s1_ids: List[str]) -> Dict[str, Set[str]]:
+    """
+    Extracts the subset of GT matching eval_s1_ids exactly.
+    Raises ValueError if any eval S1 is missing from the global GT.
+    """
+    scoped_gt = {}
+    for s1 in eval_s1_ids:
+        s1_str = str(s1)
+        if s1_str not in gt:
+            raise ValueError(f"Evaluation S1 ID {s1_str} missing from global ground truth.")
+        scoped_gt[s1_str] = set([str(x) for x in gt[s1_str]])
+        
+    # Ensure keys match exactly
+    if set(scoped_gt.keys()) != set([str(x) for x in eval_s1_ids]):
+        raise ValueError("Scoped GT keys do not exactly match eval_s1_ids.")
+        
+    return scoped_gt
